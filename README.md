@@ -1,12 +1,8 @@
 # MiniCode
 
-MiniCode 是一个面向开发者的个人 AI 编程助手项目，基于 Java 17 实现，提供类似 Claude Code 的命令行交互体验。项目围绕“让大模型可靠地理解、修改和验证代码”展开，完整实现了从单 Agent 对话到多 Agent 协作、从工具调用到 MCP 扩展、从终端交互到 Runtime API 的能力演进。
+MiniCode 是一个基于 Java 17 的 AI 编程助手，提供类似 Claude Code 的命令行交互体验。它帮助开发者理解代码、执行开发任务、检索项目内容并验证修改结果。
 
 项目地址：[https://github.com/dirge2024/MiniCode](https://github.com/dirge2024/MiniCode)
-
-## 适合简历的项目描述
-
-> 独立设计并实现 MiniCode Java AI 编程助手：基于 ReAct、Plan-and-Execute 和 Multi-Agent 架构，抽象统一工具注册与并行执行框架；接入 MCP、RAG、长期记忆、Prompt 分层、Skill、浏览器自动化和多模型适配；通过 HITL、路径围栏、命令策略和审计日志构建工具调用安全链路，并提供 JLine TUI 与 Runtime API，支持复杂代码任务的规划、执行、验证和恢复。
 
 ## 项目亮点
 
@@ -56,7 +52,7 @@ MiniCode 是一个面向开发者的个人 AI 编程助手项目，基于 Java 1
 ## 项目结构
 
 ```text
-src/main/java/com/paicli/
+src/main/java/com/
 ├── agent/       ReAct、Plan-and-Execute、Multi-Agent
 ├── cli/         CLI 入口与斜杠命令解析
 ├── llm/         多模型客户端与统一接口
@@ -81,7 +77,7 @@ git clone https://github.com/dirge2024/MiniCode.git
 cd MiniCode
 cp .env.example .env
 mvn clean package
-java -jar target/paicli-1.0-SNAPSHOT.jar
+java -jar target/<artifact>.jar
 ```
 
 可配置的 API Key 包括 `GLM_API_KEY`、`DEEPSEEK_API_KEY`、`STEP_API_KEY`、`KIMI_API_KEY`、`FREELLMAPI_API_KEY` 和 `AGNES_API_KEY`。
@@ -109,6 +105,4 @@ mvn test -Pphase16-smoke
 mvn test -DskipTests=false
 ```
 
-## 项目说明
-
-MiniCode 是个人独立开发项目，重点关注 Agent 执行可靠性、上下文管理、工具安全和终端产品化体验。项目中的 `com.paicli` 包名和 `paicli` Maven 产物名称是历史兼容信息，不影响项目名称为 MiniCode。
+MiniCode 重点关注 Agent 执行可靠性、上下文管理、工具安全和终端交互体验。
