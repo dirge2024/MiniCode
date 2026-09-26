@@ -15,10 +15,18 @@ import com.paicli.hitl.HitlToolRegistry;
 import com.paicli.hitl.SwitchableHitlHandler;
 import com.paicli.hitl.RendererHitlHandler;
 import com.paicli.hitl.TerminalHitlHandler;
+import com.paicli.history.ConversationLedger;
+import com.paicli.harness.BetterHarnessOptions;
+import com.paicli.harness.BetterHarnessRunner;
 import com.paicli.llm.LlmClient;
+import com.paicli.llm.ModelCatalog;
 import com.paicli.llm.LlmClientFactory;
 import com.paicli.memory.LongTermMemory;
+import com.paicli.memory.MemoryCommandArgs;
 import com.paicli.memory.MemoryEntry;
+import com.paicli.memory.ExternalContextTracker;
+import com.paicli.memory.MemoryManager;
+import com.paicli.memory.MemoryWriteResult;
 import com.paicli.render.Renderer;
 import com.paicli.render.RendererFactory;
 import com.paicli.render.StatusInfo;
@@ -47,6 +55,8 @@ import com.paicli.snapshot.TurnSnapshot;
 import com.paicli.skill.SkillRegistry;
 import com.paicli.tool.ToolRegistry;
 import com.paicli.util.AnsiStyle;
+import com.paicli.util.TerminalTable;
+import com.paicli.util.TerminalMarkdownRenderer;
 import com.paicli.wechat.IlinkClient;
 import com.paicli.wechat.WechatAccount;
 import com.paicli.wechat.WechatAccountStore;
@@ -99,7 +109,7 @@ import java.util.regex.Pattern;
 /**
  * PaiCLI v16.1.0 - Terminal-First Agent IDE
  * 支持 ReAct、Plan-and-Execute、Memory、RAG、Multi-Agent、HITL、并行工具调用、多模型切换、MCP、CDP 会话复用
- * 第 15 期新增：Skill 系统（三层加载 + load_skill 工具 + SkillContextBuffer 注入）、内置 web-access skill
+ * 第 15 期新增：Skill 系统（三层加载 + load_skill 工具 + 同轮正文注入）、内置 web-access skill
  * 第 16 期新增：TUI 界面（Lanterna 3）、文件树浏览、代码高亮、对话历史可视化、配置管理面板
  * 第 16.1 期形态修正：抽出 Renderer 接口 + 三个实现（inline/lanterna/plain），默认形态切换为 inline 流式 TUI（Claude Code 风格）
  *   - inline 流式：prompt 下方 inline 状态区、行内可折叠工具块、行内 git diff、单字符 HITL 提示、命令 palette
@@ -220,7 +230,7 @@ public class Main {
         LlmClient llmClient = LlmClientFactory.createFromConfig(config);
         if (llmClient == null) {
             System.err.println("❌ 错误: 未找到可用的 API Key");
-            System.err.println("请在 .env 文件中添加 GLM_API_KEY、DEEPSEEK_API_KEY、STEP_API_KEY、KIMI_API_KEY、FREELLMAPI_API_KEY、XFYUN_MAAS_API_KEY 或 AGNES_API_KEY");
+            System.err.println("请在 .env 文件中添加 DEEPSEEK_API_KEY、GLM_API_KEY、HUNYUAN_API_KEY、STEP_API_KEY、KIMI_API_KEY、FREELLMAPI_API_KEY、XFYUN_MAAS_API_KEY 或 AGNES_API_KEY");
             System.exit(1);
         }
         AtomicReference<LlmClient> llmClientRef = new AtomicReference<>(llmClient);
@@ -229,7 +239,14 @@ public class Main {
             refreshTerminalColumns(terminal);
             TerminalHitlHandler terminalHitlHandler = new TerminalHitlHandler(false);
             SwitchableHitlHandler hitlHandler = new SwitchableHitlHandler(terminalHitlHandler);
+            // 交互式 CLI 默认确认高危操作（执行命令、回滚快照、MCP 工具），/hitl off 可全部关闭
+            hitlHandler.setHighRiskConfirmationEnabled(true);
+            SessionModeController sessionModes = new SessionModeController(hitlHandler);
             HitlToolRegistry hitlToolRegistry = new HitlToolRegistry(hitlHandler);
+            // auto 模式的 Shell 命令审查：跟随当前会话的供应商，关闭思考的轻量请求；切换模型后自动重建
+            com.paicli.hitl.LlmApprovalClassifier approvalClassifier = new com.paicli.hitl.LlmApprovalClassifier(
+                    approvalClassifierClient(llmClientRef, config));
+            hitlToolRegistry.setAutoApprovalReviewer(approvalClassifier);
             BrowserSession browserSession = new BrowserSession();
             BrowserConnectivityCheck browserConnectivityCheck = new BrowserConnectivityCheck();
             hitlToolRegistry.setBrowserGuard(new BrowserGuard(browserSession, new SensitivePagePolicy()));
@@ -259,7 +276,7 @@ public class Main {
                     .terminal(terminal)
                     .history(new PaiCliHistory())
                     .completer(new PaiCliCompleter(mcpServerManager::resourceCandidates,
-                            () -> skillRegistryRef.get() == null ? List.of() : skillRegistryRef.get().allSkills()))
+                            () -> skillRegistryRef.get() == null ? List.of() : skillRegistryRef.get().allSkills(), () -> config))
                     .highlighter(new PaiCliHighlighter())
                     .build();
             lineReader.option(LineReader.Option.BRACKETED_PASTE, true);
@@ -279,7 +296,8 @@ public class Main {
             }
             PrintStream ui = renderer.stream();
             renderer.start();
-            renderer.updateStatus(statusInfo(llmClient, hitlHandler, "idle", mcpServerManager, null));
+            renderer.updateStatus(statusInfo(llmClient, hitlHandler, "idle", mcpServerManager, null)
+                    .withSessionMode(sessionModes.current().statusLabel()));
 
             String startupNote = "";
             try {
@@ -311,14 +329,30 @@ public class Main {
                     skillsCacheDir, userSkillsDir, projectSkillsDir, skillStateStore);
             skillRegistry.reload();
             skillRegistryRef.set(skillRegistry);
-            com.paicli.skill.SkillContextBuffer skillContextBuffer = new com.paicli.skill.SkillContextBuffer();
             hitlToolRegistry.setSkillRegistry(skillRegistry);
-            hitlToolRegistry.setSkillContextBuffer(skillContextBuffer);
+
+            ConversationLedger conversationLedger;
+            try {
+                conversationLedger = ConversationLedger.openDefault(home);
+            } catch (IOException e) {
+                conversationLedger = ConversationLedger.disabled();
+                startupNote = appendStartupNote(
+                        startupNote,
+                        "原始会话账本初始化失败: " + e.getMessage());
+            }
+
+            // execute_command 沙箱：默认 OFF 与旧行为一致；auto/required 时探测 Seatbelt / bubblewrap 并提示结果。
+            com.paicli.tool.CommandSandboxStatus sandboxStatus = hitlToolRegistry.configureCommandSandbox(
+                    com.paicli.tool.CommandSandboxMode.fromConfiguration(),
+                    Path.of(hitlToolRegistry.getProjectPath()));
+            startupNote = appendStartupNote(startupNote, sandboxStatus.message());
 
             Agent reactAgent = new Agent(llmClient, hitlToolRegistry);
+            reactAgent.getMemoryManager().setAutoFactExtractionEnabled(
+                    com.paicli.memory.AutoFactExtractor.enabledByConfiguration());
+            reactAgent.setConversationLedger(conversationLedger);
             reactAgent.setExternalContextSupplier(mcpServerManager::resourceIndexForPrompt);
             reactAgent.setSkillRegistry(skillRegistry);
-            reactAgent.setSkillContextBuffer(skillContextBuffer);
             DurableTaskManager taskManager = openTaskManager(llmClientRef);
             taskManager.start();
             Runtime.getRuntime().addShutdownHook(new Thread(taskManager::close, "paicli-task-shutdown"));
@@ -349,7 +383,16 @@ public class Main {
             }
 
             reactAgent.setRenderer(renderer);
-            reactAgent.setHitlEnabledSupplier(hitlHandler::isEnabled);
+            reactAgent.setHitlEnabledSupplier(hitlHandler::isConfirmationActive);
+            reactAgent.setSessionModeSupplier(() -> sessionModes.current().statusLabel());
+            bindSessionModeCycle(lineReader, () -> {
+                SessionMode mode = sessionModes.cycle();
+                renderer.updateStatus(statusInfo(reactAgent, mcpServerManager, skillRegistryRef.get(), "idle"));
+                if (!(renderer instanceof InlineRenderer inline && inline.hasStatusBar())) {
+                    // 没有底部状态栏时，在提示符上方打印一行，否则切换没有任何可见反馈
+                    lineReader.printAbove("模式：" + SessionModeController.describe(mode));
+                }
+            });
             reactAgent.getToolRegistry().setWriteFileObserver(
                     (path, ba) -> renderer.appendDiff(path, ba[0], ba[1]));
 
@@ -494,14 +537,17 @@ public class Main {
                         ui.println("   /memory list - 查看长期记忆");
                         ui.println("   /memory search <关键词> - 搜索当前项目可见长期记忆");
                         ui.println("   /memory delete <id> - 删除单条长期记忆");
+                        ui.println("   /memory verify <id> - 确认记忆仍然成立，刷新最后核实时间");
+                        ui.println("   /memory replace <id> <新事实> - 用新内容替换冲突/过时的记忆");
                         ui.println("   /memory clear - 清空长期记忆");
                         ui.println("   /save <事实> - 保存项目级长期记忆；/save --global <事实> 保存全局记忆");
+                        ui.println("   /save --force <事实> - 与已有记忆冲突时仍保留两条");
                         ui.println();
                         continue;
                     }
                     case MEMORY_LIST -> {
                         List<MemoryEntry> entries = reactAgent.getMemoryManager().listLongTerm();
-                        ui.println(formatMemoryEntries("📋 长期记忆列表", entries));
+                        ui.println(formatMemoryEntries("📋 长期记忆列表", entries, reactAgent.getMemoryManager()));
                         ui.println();
                         continue;
                     }
@@ -511,7 +557,8 @@ public class Main {
                             ui.println("❌ 请提供搜索关键词，例如 /memory search Chrome 登录态\n");
                         } else {
                             List<MemoryEntry> entries = reactAgent.getMemoryManager().searchLongTerm(query, 20);
-                            ui.println(formatMemoryEntries("🔎 长期记忆搜索: " + query, entries));
+                            ui.println(formatMemoryEntries("🔎 长期记忆搜索: " + query, entries,
+                                    reactAgent.getMemoryManager()));
                             ui.println();
                         }
                         continue;
@@ -534,12 +581,34 @@ public class Main {
                         continue;
                     }
                     case MEMORY_SAVE -> {
-                        MemorySaveRequest saveRequest = parseMemorySave(command.payload());
+                        MemoryCommandArgs.SaveRequest saveRequest = MemoryCommandArgs.parseSave(command.payload());
                         if (saveRequest.fact().isEmpty()) {
                             ui.println("❌ 请提供要保存的内容，例如 /save 这个项目使用Java 17，或 /save --global 默认用中文回答\n");
                         } else {
-                            reactAgent.getMemoryManager().storeFact(saveRequest.fact(), saveRequest.scope());
-                            ui.println("💾 已保存到长期记忆(" + saveRequest.scope() + "): " + saveRequest.fact() + "\n");
+                            MemoryWriteResult result = reactAgent.getMemoryManager().storeFact(
+                                    saveRequest.fact(), saveRequest.scope(), null, saveRequest.force());
+                            ui.println(result.describe() + "\n");
+                        }
+                        continue;
+                    }
+                    case MEMORY_VERIFY -> {
+                        String id = command.payload();
+                        if (id == null || id.isBlank()) {
+                            ui.println("❌ 请提供要核实的记忆 id，例如 /memory verify fact-abcd1234\n");
+                        } else {
+                            ui.println(reactAgent.getMemoryManager().verifyLongTerm(id)
+                                    .map(entry -> "✅ 已刷新核实时间: " + entry.getId() + " " + entry.getContent())
+                                    .orElse("📭 未找到长期记忆: " + id) + "\n");
+                        }
+                        continue;
+                    }
+                    case MEMORY_REPLACE -> {
+                        MemoryCommandArgs.ReplaceRequest replaceRequest = MemoryCommandArgs.parseReplace(command.payload());
+                        if (!replaceRequest.valid()) {
+                            ui.println("❌ 用法: /memory replace <旧记忆 id> <新事实>，例如 /memory replace fact-abcd1234 项目使用 Java 21\n");
+                        } else {
+                            ui.println(reactAgent.getMemoryManager()
+                                    .replaceFact(replaceRequest.id(), replaceRequest.fact()).describe() + "\n");
                         }
                         continue;
                     }
@@ -559,57 +628,57 @@ public class Main {
                         }
                         input = command.payload();
                     }
+                    case MODEL_MANAGE -> {
+                        try {
+                            ui.println(ModelCommands.handle(command.payload(), config, llmClient));
+                        } catch (IOException | IllegalArgumentException e) {
+                            ui.println("❌ " + e.getMessage());
+                        }
+                        continue;
+                    }
                     case SWITCH_MODEL -> {
                         String selection = command.payload();
                         if (selection == null || selection.isEmpty()) {
-                            ui.println("🤖 当前模型: " + llmClient.getModelName() + " (" + llmClient.getProviderName() + ")");
-                            ui.println("   GLM 明确模型：");
+                            ui.println("🤖 当前模型: " + ModelCatalog.displayName(llmClient.getProviderName(), llmClient.getModelName()) + " (" + llmClient.getProviderName() + ")");
+                            ui.println("   管理模型: /model list / /model info / /model refresh <provider> / /model add");
+                            ui.println("   明确模型：");
+                            ui.println("   /model deepseek-flash - 切换到 DeepSeek V4.1 Flash（默认，支持图片）");
+                            ui.println("   /model glm-5.3-flash - 切换到 GLM-5.3-Flash");
                             ui.println("   /model glm-5.1       - 切换到 GLM-5.1");
                             ui.println("   /model glm-5v-turbo  - 切换到 GLM-5V-Turbo 多模态");
                             ui.println("   其它 provider 使用你配置里的具体模型：");
                             ui.println("   /model deepseek      - 切换到 DeepSeek（读取配置模型）");
+                            ui.println("   /model hunyuan       - 切换到混元（读取配置模型）");
+                            ui.println("   /model hy4-preview   - 切换到混元 Hy4 preview");
                             ui.println("   /model step          - 切换到 StepFun（读取配置模型）");
                             ui.println("   /model kimi          - 切换到 Kimi（读取配置模型）");
                             ui.println("   /model freellmapi    - 切换到本地 FreeLLMAPI（读取配置模型）");
                             ui.println("   /model xfyun         - 切换到讯飞星辰 MaaS（读取配置模型）");
                             ui.println("   /model agnes         - 切换到 Agnes 2.0 Flash（读取配置模型）\n");
                         } else {
-                            ModelSelection target = resolveModelSelection(selection);
-                            if (target.explicitModel()) {
-                                ensureProviderConfig(config, target.provider()).setModel(target.model());
-                            }
-                            LlmClient newClient = LlmClientFactory.create(target.provider(), config);
-                            if (newClient == null) {
-                                ui.println("❌ 切换失败：未配置 " + target.provider() + " 的 API Key\n");
-                            } else {
+                            try {
+                                ModelSelection target = resolveModelSelection(selection, config);
+                                LlmClient newClient = ModelCommands.switchModel(config, target);
                                 llmClient = newClient;
                                 llmClientRef.set(newClient);
-                                config.setDefaultProvider(target.provider());
-                                config.save();
                                 reactAgent.setLlmClient(llmClient);
-                                ui.println("✅ 已切换到: " + llmClient.getModelName() + " (" + llmClient.getProviderName() + ")");
-                                ui.println("   上下文策略: " + reactAgent.getMemoryManager().getContextProfile().summary());
-                                ui.println("   对话上下文已保留，使用 /clear 可清空\n");
+                                ui.println(ModelCommands.switchSummary(llmClient));
+                                ui.println();
                                 renderer.updateStatus(statusInfo(reactAgent, mcpServerManager, skillRegistry, "idle"));
+                            } catch (IOException | IllegalArgumentException e) {
+                                ui.println("❌ 切换失败: " + e.getMessage());
                             }
                         }
                         continue;
                     }
+                    case SESSION_MODE -> {
+                        ui.println("🧭 " + sessionModes.handleCommand(command.payload()) + "\n");
+                        renderer.updateStatus(statusInfo(reactAgent, mcpServerManager, skillRegistry, "idle"));
+                        continue;
+                    }
                     case SWITCH_HITL -> {
                         String payload = command.payload();
-                        if ("on".equals(payload)) {
-                            hitlHandler.setEnabled(true);
-                            ui.println("🔒 HITL 审批已启用：write_file / execute_command / create_project 执行前将请求人工确认\n");
-                        } else if ("off".equals(payload)) {
-                            hitlHandler.setEnabled(false);
-                            hitlHandler.clearApprovedAll();
-                            ui.println("🔓 HITL 审批已关闭：危险操作将直接执行\n");
-                        } else {
-                            String status = hitlHandler.isEnabled() ? "启用" : "关闭";
-                            ui.println("🔒 HITL 当前状态：" + status);
-                            ui.println("   /hitl on  - 启用人工审批");
-                            ui.println("   /hitl off - 关闭人工审批\n");
-                        }
+                        ui.println("🔒 " + hitlHandler.switchConfirmationMode(payload == null ? "" : payload) + "\n");
                         renderer.updateStatus(statusInfo(reactAgent, mcpServerManager, skillRegistry, "idle"));
                         continue;
                     }
@@ -714,6 +783,81 @@ public class Main {
                         renderer.updateStatus(statusInfo(reactAgent, mcpServerManager, skillRegistry, "idle"));
                         continue;
                     }
+                    case BETTER_HARNESS -> {
+                        BetterHarnessOptions.ParseResult parsed =
+                                BetterHarnessOptions.parse(command.payload());
+                        if (!parsed.valid()) {
+                            ui.println("❌ " + parsed.error() + "\n");
+                            continue;
+                        }
+                        ui.println("🔎 Better Harness 开始审查当前项目\n");
+                        renderer.updateStatus(
+                                statusInfo(reactAgent, mcpServerManager, skillRegistry, "harness"));
+                        boolean activityPanel = renderer.supportsActivityPanel();
+                        if (activityPanel) {
+                            renderer.beginActivity(
+                                    "Better Harness",
+                                    "正在准备审计 · 按 ESC 可取消",
+                                    true);
+                        } else {
+                            ui.println("⏳ 0/5 · 正在准备审计 · 按 ESC 可取消");
+                        }
+                        AtomicReference<BetterHarnessRunner.RunResult> resultRef =
+                                new AtomicReference<>();
+                        String runStatus;
+                        try {
+                            BetterHarnessRunner runner = new BetterHarnessRunner(
+                                    llmClient,
+                                    Path.of(reactAgent.getToolRegistry().getProjectPath()),
+                                    reactAgent.getConversationLedger(),
+                                    skillRegistry);
+                            runStatus = runWithCancelSupport(
+                                    terminal,
+                                    ui,
+                                    () -> {
+                                        resultRef.set(runner.run(
+                                                parsed.options(),
+                                                event -> {
+                                                    String progress =
+                                                            formatBetterHarnessProgress(event);
+                                                    if (activityPanel) {
+                                                        renderer.updateActivity(
+                                                                event.message(),
+                                                                event.completed(),
+                                                                event.total());
+                                                    } else {
+                                                        ui.println("⏳ " + progress);
+                                                    }
+                                                }));
+                                        return "";
+                                    });
+                        } finally {
+                            if (activityPanel) {
+                                renderer.endActivity();
+                            }
+                            renderer.updateStatus(
+                                    statusInfo(reactAgent, mcpServerManager, skillRegistry, "idle"));
+                        }
+                        BetterHarnessRunner.RunResult result = resultRef.get();
+                        if (result == null) {
+                            ui.println(runStatus == null || runStatus.isBlank()
+                                    ? "❌ Better Harness 未生成报告\n"
+                                    : runStatus + "\n");
+                            continue;
+                        }
+                        ui.print(renderBetterHarnessMarkdown(
+                                result.reportMarkdown(),
+                                renderer.terminalColumns()));
+                        ui.println();
+                        if (result.durable()) {
+                            ui.println("✅ " + result.findingCount() + " 个 findings");
+                            ui.println("   Markdown: " + result.reportMarkdownPath());
+                            ui.println("   HTML: " + result.reportHtmlPath());
+                            ui.println("   JSON: " + result.findingsJsonPath());
+                            ui.println();
+                        }
+                        continue;
+                    }
                     case EXPORT -> {
                         handleExportCommand(ui, reactAgent);
                         continue;
@@ -804,30 +948,37 @@ public class Main {
                     printSubmittedInput(renderer, ui, submittedInput);
                 }
                 final String taskInput = input;
+                approvalClassifier.setCurrentUserRequest(submittedInput);
+                hitlToolRegistry.startAutoReviewTurn();
                 Callable<String> runTask;
                 String snapshotMode;
-                if (nextTaskUsePlanMode || command.type() == CliCommandParser.CommandType.SWITCH_PLAN) {
+                boolean teamRequested = nextTaskUseTeamMode
+                        || command.type() == CliCommandParser.CommandType.SWITCH_TEAM;
+                // 显式 /team 优先；plan 模式只接管普通输入
+                boolean planRequested = nextTaskUsePlanMode
+                        || command.type() == CliCommandParser.CommandType.SWITCH_PLAN
+                        || (sessionModes.planMode() && !teamRequested);
+                if (planRequested) {
                     snapshotMode = "plan";
                     LlmClient activeClient = llmClient;
                     runTask = () -> {
                         PlanExecuteAgent planAgent = createPlanAgent(activeClient, reactAgent, terminal, lineReader, ui);
                         planAgent.setExternalContextSupplier(mcpServerManager::resourceIndexForPrompt);
                         planAgent.setSkillRegistry(skillRegistry);
-                        planAgent.setSkillContextBuffer(skillContextBuffer);
-                        return planAgent.run(taskInput);
+                        return planAgent.run(taskInput, submittedInput);
                     };
-                } else if (nextTaskUseTeamMode || command.type() == CliCommandParser.CommandType.SWITCH_TEAM) {
+                } else if (teamRequested) {
                     snapshotMode = "team";
                     LlmClient activeClient = llmClient;
                     runTask = () -> {
                         AgentOrchestrator orchestrator = createTeamAgent(activeClient, reactAgent, ui);
                         orchestrator.setExternalContextSupplier(mcpServerManager::resourceIndexForPrompt);
-                        orchestrator.setSkillSystem(skillRegistry, skillContextBuffer);
-                        return orchestrator.run(taskInput);
+                        orchestrator.setSkillSystem(skillRegistry);
+                        return orchestrator.run(taskInput, submittedInput);
                     };
                 } else {
                     snapshotMode = "react";
-                    runTask = () -> reactAgent.run(taskInput);
+                    runTask = () -> reactAgent.run(taskInput, submittedInput);
                 }
                 SnapshotService snapshotService = reactAgent.getToolRegistry().getSnapshotService();
                 renderer.updateStatus(statusInfo(reactAgent, mcpServerManager, skillRegistry, snapshotMode));
@@ -911,7 +1062,19 @@ public class Main {
     private static String runHeadlessTask(String prompt, LlmClient llmClient) {
         ToolRegistry registry = new ToolRegistry();
         registry.setProjectPath(Path.of(".").toAbsolutePath().normalize().toString());
+        com.paicli.tool.CommandSandboxStatus sandboxStatus = registry.configureCommandSandbox(
+                com.paicli.tool.CommandSandboxMode.fromConfiguration(),
+                Path.of(registry.getProjectPath()));
+        if (!sandboxStatus.message().isBlank()) {
+            System.err.println(sandboxStatus.message());
+        }
         Agent agent = new Agent(llmClient, registry);
+        try {
+            agent.setConversationLedger(ConversationLedger.openDefault(
+                    Path.of(System.getProperty("user.home"))));
+        } catch (IOException ignored) {
+            // A background task should still run if its audit directory is temporarily unavailable.
+        }
         return agent.run(prompt);
     }
 
@@ -1079,30 +1242,51 @@ public class Main {
 
     static PlanExecuteAgent createPlanAgent(LlmClient llmClient, Agent reactAgent,
                                             PlanExecuteAgent.PlanReviewHandler reviewHandler) {
-        return new PlanExecuteAgent(
+        PlanExecuteAgent planAgent = new PlanExecuteAgent(
                 llmClient,
                 reactAgent.getToolRegistry(),
                 reactAgent.getMemoryManager(),
                 reviewHandler,
                 System.out
         );
+        planAgent.setConversationLedger(reactAgent.getConversationLedger());
+        return planAgent;
     }
 
     private static PlanExecuteAgent createPlanAgent(LlmClient llmClient, Agent reactAgent,
                                                     Terminal terminal, LineReader lineReader, PrintStream out) {
         out.println("📋 使用 Plan-and-Execute 模式\n");
-        return new PlanExecuteAgent(
+        PlanExecuteAgent planAgent = new PlanExecuteAgent(
                 llmClient,
                 reactAgent.getToolRegistry(),
                 reactAgent.getMemoryManager(),
                 createPlanReviewHandler(terminal, lineReader, out),
                 out
         );
+        planAgent.setConversationLedger(reactAgent.getConversationLedger());
+        return planAgent;
     }
 
     private static AgentOrchestrator createTeamAgent(LlmClient llmClient, Agent reactAgent, PrintStream out) {
         out.println("👥 使用 Multi-Agent 协作模式\n");
-        return new AgentOrchestrator(llmClient, reactAgent.getToolRegistry(), reactAgent.getMemoryManager(), out);
+        AgentOrchestrator orchestrator =
+                new AgentOrchestrator(llmClient, reactAgent.getToolRegistry(), reactAgent.getMemoryManager(), out);
+        orchestrator.setConversationLedger(reactAgent.getConversationLedger());
+        return orchestrator;
+    }
+
+    static String formatBetterHarnessProgress(BetterHarnessRunner.ProgressEvent event) {
+        if (event == null) {
+            return "0/0 · 等待进度";
+        }
+        return event.completed() + "/" + event.total() + " · " + event.message();
+    }
+
+    static String renderBetterHarnessMarkdown(String markdown, int terminalColumns) {
+        if (markdown == null || markdown.isBlank()) {
+            return "";
+        }
+        return TerminalMarkdownRenderer.render(markdown, terminalColumns);
     }
 
     private static String runWithCancelSupport(Terminal terminal, PrintStream out, Callable<String> task) {
@@ -1285,14 +1469,14 @@ public class Main {
         String configured = System.getProperty("paicli.render.columns");
         if (configured != null && !configured.isBlank()) {
             try {
-                return Math.max(40, Integer.parseInt(configured.trim()));
+                return Math.max(20, Integer.parseInt(configured.trim()));
             } catch (NumberFormatException ignored) {
             }
         }
         String columns = System.getenv("COLUMNS");
         if (columns != null && !columns.isBlank()) {
             try {
-                return Math.max(40, Integer.parseInt(columns.trim()));
+                return Math.max(20, Integer.parseInt(columns.trim()));
             } catch (NumberFormatException ignored) {
             }
         }
@@ -1303,7 +1487,7 @@ public class Main {
         if (terminal == null || terminal.getSize() == null || terminal.getSize().getColumns() <= 0) {
             return;
         }
-        System.setProperty("paicli.render.columns", String.valueOf(Math.max(40, terminal.getSize().getColumns())));
+        System.setProperty("paicli.render.columns", String.valueOf(Math.max(20, terminal.getSize().getColumns())));
     }
 
     static void configureAwtForCli() {
@@ -1527,24 +1711,37 @@ public class Main {
     static List<SlashCommandHint> slashCommandHints() {
         return List.of(
                 new SlashCommandHint("/model", "/model", "查看当前模型"),
+                new SlashCommandHint("/model list", "/model list", "查看模型列表与能力"),
+                new SlashCommandHint("/model info ", "/model info [模型ID]", "查看模型详细配置"),
+                new SlashCommandHint("/model refresh ", "/model refresh <provider>", "手动刷新模型列表"),
+                new SlashCommandHint("/model add ", "/model add <provider> <模型ID>", "添加或更新模型能力"),
+                new SlashCommandHint("/model deepseek-flash", "/model deepseek-flash", "切换到 DeepSeek V4.1 Flash（默认，支持图片）"),
+                new SlashCommandHint("/model glm-5.3-flash", "/model glm-5.3-flash", "切换到 GLM-5.3-Flash"),
                 new SlashCommandHint("/model glm-5.1", "/model glm-5.1", "切换到 GLM-5.1"),
                 new SlashCommandHint("/model glm-5v-turbo", "/model glm-5v-turbo", "切换到 GLM-5V-Turbo 多模态"),
                 new SlashCommandHint("/model deepseek", "/model deepseek", "切换到 DeepSeek（读取配置模型）"),
+                new SlashCommandHint("/model hunyuan", "/model hunyuan", "切换到混元（读取配置模型）"),
+                new SlashCommandHint("/model hy4-preview", "/model hy4-preview", "切换到混元 Hy4 preview"),
                 new SlashCommandHint("/model step", "/model step", "切换到 StepFun（读取配置模型）"),
                 new SlashCommandHint("/model kimi", "/model kimi", "切换到 Kimi（读取配置模型）"),
                 new SlashCommandHint("/model freellmapi", "/model freellmapi", "切换到本地 FreeLLMAPI（读取配置模型）"),
                 new SlashCommandHint("/model xfyun", "/model xfyun", "切换到讯飞星辰 MaaS（读取配置模型）"),
                 new SlashCommandHint("/model agnes", "/model agnes", "切换到 Agnes 2.0 Flash（读取配置模型）"),
                 new SlashCommandHint("/config provider freellmapi ", "/config provider freellmapi <选项>", "配置本地 FreeLLMAPI provider"),
+                new SlashCommandHint("/config provider hunyuan ", "/config provider hunyuan <选项>", "配置混元 provider"),
                 new SlashCommandHint("/config provider xfyun ", "/config provider xfyun <选项>", "配置讯飞星辰 MaaS provider"),
                 new SlashCommandHint("/config provider agnes ", "/config provider agnes <选项>", "配置 Agnes provider"),
                 new SlashCommandHint("/plan", "/plan", "下一条任务使用 Plan-and-Execute 模式"),
                 new SlashCommandHint("/plan ", "/plan <任务内容>", "直接用计划模式执行这条任务"),
                 new SlashCommandHint("/team", "/team", "下一条任务使用 Multi-Agent 协作模式"),
                 new SlashCommandHint("/team ", "/team <任务内容>", "直接用多 Agent 协作执行这条任务"),
+                new SlashCommandHint("/mode", "/mode", "查看模式（Shift+Tab 循环切换）"),
+                new SlashCommandHint("/mode auto", "/mode auto", "自动审查，低风险命令直接执行（默认）"),
+                new SlashCommandHint("/mode plan", "/mode plan", "每条输入先规划，审阅后执行"),
+                new SlashCommandHint("/mode ask", "/mode ask", "审批：全部危险操作都确认"),
                 new SlashCommandHint("/hitl", "/hitl", "查看 HITL 状态"),
-                new SlashCommandHint("/hitl on", "/hitl on", "启用危险操作人工审批"),
-                new SlashCommandHint("/hitl off", "/hitl off", "关闭 HITL 审批"),
+                new SlashCommandHint("/hitl on", "/hitl on", "全部危险操作都确认"),
+                new SlashCommandHint("/hitl default", "/hitl default", "切回 auto（默认）"),
                 new SlashCommandHint("/browser", "/browser", "查看浏览器会话状态"),
                 new SlashCommandHint("/browser connect", "/browser connect", "复用已允许远程调试的登录态 Chrome"),
                 new SlashCommandHint("/browser connect ", "/browser connect <port>", "旧式 CDP 端口连接"),
@@ -1588,14 +1785,20 @@ public class Main {
                 new SlashCommandHint("/memory list", "/memory list", "查看长期记忆列表"),
                 new SlashCommandHint("/memory search ", "/memory search <关键词>", "搜索当前项目可见长期记忆"),
                 new SlashCommandHint("/memory delete ", "/memory delete <id>", "删除单条长期记忆"),
+                new SlashCommandHint("/memory verify ", "/memory verify <id>", "确认记忆仍然成立，刷新核实时间"),
+                new SlashCommandHint("/memory replace ", "/memory replace <id> <新事实>", "用新内容替换冲突或过时的记忆"),
                 new SlashCommandHint("/memory clear", "/memory clear", "清空长期记忆"),
-                new SlashCommandHint("/save ", "/save [--global] <事实内容>", "手动保存项目级或全局长期记忆"),
+                new SlashCommandHint("/save ", "/save [--global] [--force] <事实内容>", "手动保存项目级或全局长期记忆"),
                 new SlashCommandHint("/skill", "/skill", "查看 skill 列表"),
                 new SlashCommandHint("/skill list", "/skill list", "查看 skill 列表"),
                 new SlashCommandHint("/skill show ", "/skill show <name>", "查看 SKILL.md 全文"),
                 new SlashCommandHint("/skill on ", "/skill on <name>", "启用 skill"),
                 new SlashCommandHint("/skill off ", "/skill off <name>", "禁用 skill"),
                 new SlashCommandHint("/skill reload", "/skill reload", "重新扫描 skill 目录"),
+                new SlashCommandHint("/better-harness", "/better-harness", "审查当前项目的 AI 编码工作流"),
+                new SlashCommandHint("/better-harness quick", "/better-harness quick", "快速生成 Better Harness 报告"),
+                new SlashCommandHint("/better-harness normal", "/better-harness normal", "完整生成 Better Harness 报告"),
+                new SlashCommandHint("/better-harness --inline", "/better-harness --inline", "只在终端输出，不写报告文件"),
                 new SlashCommandHint("/export", "/export", "导出当前会话对话记录为 Markdown"),
                 new SlashCommandHint("/exit", "/exit", "退出 PaiCLI"),
                 new SlashCommandHint("/quit", "/quit", "退出 PaiCLI")
@@ -1650,6 +1853,53 @@ public class Main {
         return tips;
     }
 
+    /**
+     * 审批分类器的模型：默认沿用当前会话的供应商与模型（请求时关闭思考），
+     * 可用 PAICLI_AUTO_CLASSIFIER_MODEL 指定同一供应商下更便宜的模型 ID。按供应商 + 模型缓存。
+     */
+    static java.util.function.Supplier<LlmClient> approvalClassifierClient(AtomicReference<LlmClient> current,
+                                                                         PaiCliConfig config) {
+        AtomicReference<String> cachedKey = new AtomicReference<>();
+        AtomicReference<LlmClient> cachedClient = new AtomicReference<>();
+        return () -> {
+            LlmClient session = current.get();
+            if (session == null) {
+                return null;
+            }
+            String override = loadConfigValue("PAICLI_AUTO_CLASSIFIER_MODEL", null);
+            String model = override == null || override.isBlank() ? session.getModelName() : override.trim();
+            String key = session.getProviderName() + "/" + model;
+            if (!key.equals(cachedKey.get())) {
+                cachedClient.set(LlmClientFactory.createApprovalClassifier(session.getProviderName(), model, config));
+                cachedKey.set(key);
+            }
+            return cachedClient.get();
+        };
+    }
+
+    /** Shift+Tab 在终端里发送 ESC [ Z，绑定成循环切换会话模式。 */
+    static final String SHIFT_TAB = "\033[Z";
+
+    static void bindSessionModeCycle(LineReader lineReader, Runnable onCycle) {
+        if (lineReader == null) {
+            return;
+        }
+        lineReader.getWidgets().put("paicli-cycle-session-mode", () -> {
+            onCycle.run();
+            if (lineReader.isReading()) {
+                lineReader.callWidget(LineReader.REDISPLAY);
+            }
+            return true;
+        });
+        Reference cycle = new Reference("paicli-cycle-session-mode");
+        for (String keyMapName : List.of(LineReader.MAIN, LineReader.EMACS, LineReader.VIINS)) {
+            KeyMap<org.jline.reader.Binding> keyMap = lineReader.getKeyMaps().get(keyMapName);
+            if (keyMap != null) {
+                keyMap.bind(cycle, SHIFT_TAB);
+            }
+        }
+    }
+
     private static void bindSlashWidget(LineReader lineReader, String keyMapName, Reference slashHint) {
         KeyMap<org.jline.reader.Binding> keyMap = lineReader.getKeyMaps().get(keyMapName);
         if (keyMap != null) {
@@ -1698,7 +1948,7 @@ public class Main {
         var items = java.util.List.of(
                 "模型: " + (llmClient == null ? "(none)" : llmClient.getModelName() + " / " + llmClient.getProviderName()),
                 "默认 Provider: " + (config == null ? "(none)" : config.getDefaultProvider()),
-                "HITL: " + (hitlHandler.isEnabled() ? "ON" : "OFF"),
+                "HITL: " + hitlHandler.confirmationModeLabel(),
                 "Skill 启用数: " + (skillRegistry == null ? 0 : skillRegistry.enabledSkills().size()),
                 "渲染器: " + renderer.getClass().getSimpleName(),
                 "配置文件: ~/.paicli/config.json (只读视图，编辑请用编辑器)"
@@ -1709,7 +1959,7 @@ public class Main {
             return;
         }
         String hint = switch (selected) {
-            case 0, 1 -> "💡 GLM: /model glm-5.1 / /model glm-5v-turbo；其它: /model deepseek|step|kimi|freellmapi|xfyun|agnes 读取配置模型";
+            case 0, 1 -> "💡 GLM: /model glm-5.3-flash / /model glm-5.1 / /model glm-5v-turbo；其它: /model deepseek|hunyuan|step|kimi|freellmapi|xfyun|agnes 读取配置模型";
             case 2 -> "💡 切换 HITL: /hitl on / /hitl off";
             case 3 -> "💡 管理 Skill: /skill list / /skill on <name> / /skill off <name>";
             case 4 -> "💡 切换渲染器（重启后生效）: PAICLI_RENDERER=inline|lanterna|plain";
@@ -1824,10 +2074,12 @@ public class Main {
                 用法:
                   /config provider freellmapi --base-url http://localhost:5173/v1 --api-key <key> --model auto
                   /config provider freellmapi --model qwen/qwen3-coder:free --default
+                  /config provider hunyuan --base-url https://tokenhub.tencentmaas.com/v1 --api-key <key> --model hy4-preview --default
                   /config provider xfyun --base-url https://maas-api.cn-huabei-1.xf-yun.com/v2 --api-key <key> --model Qwen3.6-35B-A3B --default
                   /config provider xfyun --lora-id <resourceId>
                   /config provider agnes --api-key <key> --model agnes-2.0-flash --default
                   /model freellmapi
+                  /model hunyuan
                   /model xfyun
                   /model agnes
                 """.stripTrailing();
@@ -1886,6 +2138,7 @@ public class Main {
         String provider = raw == null ? "" : raw.trim().toLowerCase(Locale.ROOT);
         return switch (provider) {
             case "stepfun", "step-fun" -> "step";
+            case "hy4", "hy4-preview", "tokenhub", "tencent-hunyuan", "tencent_hunyuan" -> "hunyuan";
             case "moonshot", "moonshotai", "moonshot-ai" -> "kimi";
             case "free-llm-api", "free_llm_api", "freellm", "free-llm" -> "freellmapi";
             case "xfyun-maas", "xfyun_maas", "iflytek", "iflytek-maas", "iflytek_maas", "maas" -> "xfyun";
@@ -1895,7 +2148,7 @@ public class Main {
     }
 
     private static boolean isSupportedProvider(String provider) {
-        return List.of("glm", "deepseek", "step", "kimi", "freellmapi", "xfyun", "agnes").contains(provider);
+        return List.of("glm", "deepseek", "hunyuan", "step", "kimi", "freellmapi", "xfyun", "agnes").contains(provider);
     }
 
     private static String maskSecret(String value) {
@@ -2140,7 +2393,7 @@ public class Main {
         out.println("🛡️ 安全策略状态：");
         out.println("   项目根: " + reactAgent.getToolRegistry().getProjectPath());
         out.println("   危险工具: " + String.join(", ", ApprovalPolicy.getDangerousTools()) + "，以及所有 mcp__ 前缀工具");
-        out.println("   路径围栏: 强制限定在项目根之内（read_file / write_file / list_dir / create_project）");
+        out.println("   路径围栏: 强制限定在项目根之内（read_file / write_file / edit_file / list_dir / create_project）");
         out.println("   命令黑名单: sudo / rm -rf 全盘 / mkfs / dd of=/dev / fork bomb / curl|sh / find / / chmod 777 / / shutdown");
         out.println("   写入文件上限: 5MB");
         out.println("   命令执行上限: 60 秒，输出 8KB（截断）");
@@ -2424,14 +2677,15 @@ public class Main {
         int skillTotal = skillRegistry.allSkills().size();
         int skillEnabled = skillRegistry.enabledSkills().size();
         return new StartupScreenInfo(
-                llmClient.getModelName(),
+                ModelCatalog.statusName(llmClient.getProviderName(), llmClient.getModelName()),
                 llmClient.getProviderName(),
                 ready,
                 total,
                 tools,
                 skillEnabled,
                 skillTotal,
-                note == null ? "" : note.trim()
+                (note == null ? "" : note.trim())
+                        + ModelCommands.aliasHint(llmClient.getProviderName(), llmClient.getModelName())
         );
     }
 
@@ -2442,9 +2696,9 @@ public class Main {
                                          SkillRegistry skillRegistry) {
         String normalizedPhase = phase == null || phase.isBlank() ? "idle" : phase;
         StatusInfo base = "idle".equals(normalizedPhase)
-                ? StatusInfo.idle(llmClient.getModelName(), llmClient.maxContextWindow(), hitlHandler.isEnabled())
-                : StatusInfo.active(llmClient.getModelName(), llmClient.maxContextWindow(),
-                hitlHandler.isEnabled(), normalizedPhase);
+                ? StatusInfo.idle(ModelCatalog.statusName(llmClient.getProviderName(), llmClient.getModelName()), llmClient.maxContextWindow(), hitlHandler.isConfirmationActive())
+                : StatusInfo.active(ModelCatalog.statusName(llmClient.getProviderName(), llmClient.getModelName()), llmClient.maxContextWindow(),
+                hitlHandler.isConfirmationActive(), normalizedPhase);
         return base.withEnvironment(mcpStatusSummary(mcpServerManager), skillStatusSummary(skillRegistry));
     }
 
@@ -2656,13 +2910,6 @@ public class Main {
         };
     }
 
-    /**
-     * 从 .env 文件加载 API Key
-     */
-    private static String loadApiKey() {
-        return loadConfigValue("GLM_API_KEY", null);
-    }
-
     private static void configureLogging() {
         configureLogProperty(LOG_DIR_PROPERTY, "PAICLI_LOG_DIR",
                 Path.of(System.getProperty("user.home"), ".paicli", "logs").toString());
@@ -2752,12 +2999,34 @@ public class Main {
         return null;
     }
 
+    static ModelSelection resolveModelSelection(String raw, PaiCliConfig config) {
+        String value = raw == null ? "" : raw.trim();
+        int slash = value.indexOf('/');
+        if (slash > 0 && com.paicli.llm.ModelCatalog.BUILTINS.containsKey(value.substring(0, slash))) {
+            String model = value.substring(slash + 1);
+            if (!com.paicli.llm.ModelCatalog.validModelId(model)) throw new IllegalArgumentException("模型 ID 无效");
+            return new ModelSelection(value.substring(0, slash), model, true);
+        }
+        if (!com.paicli.llm.ModelCatalog.BUILTINS.containsKey(value)) {
+            List<String> matches = new ArrayList<>();
+            for (String provider : com.paicli.llm.ModelCatalog.BUILTINS.keySet()) {
+                if (com.paicli.llm.ModelCatalog.entries(config, provider).containsKey(value)) matches.add(provider);
+            }
+            if (matches.size() > 1) throw new IllegalArgumentException("模型 ID 属于多个供应商，请使用 /model <provider>/<模型ID>");
+            if (matches.size() == 1) return new ModelSelection(matches.get(0), value, true);
+        }
+        return resolveModelSelection(raw);
+    }
+
     static ModelSelection resolveModelSelection(String raw) {
         String value = raw == null ? "" : raw.trim();
         String normalized = value.toLowerCase(Locale.ROOT);
         return switch (normalized) {
             case "glm" -> new ModelSelection("glm", "glm-5.1", true);
             case "deepseek" -> new ModelSelection("deepseek", null, false);
+            case "hunyuan", "hy4", "tokenhub", "tencent-hunyuan", "tencent_hunyuan" ->
+                    new ModelSelection("hunyuan", null, false);
+            case "hy4-preview" -> new ModelSelection("hunyuan", value, true);
             case "step", "stepfun", "step-fun" -> new ModelSelection("step", null, false);
             case "kimi", "moonshot", "moonshotai", "moonshot-ai" -> new ModelSelection("kimi", null, false);
             case "freellmapi", "free-llm-api", "free_llm_api", "freellm", "free-llm" ->
@@ -2772,6 +3041,9 @@ public class Main {
                 }
                 if (normalized.startsWith("deepseek")) {
                     yield new ModelSelection("deepseek", value, true);
+                }
+                if (normalized.startsWith("hy4-") || normalized.startsWith("hunyuan-")) {
+                    yield new ModelSelection("hunyuan", value, true);
                 }
                 if (normalized.startsWith("step")) {
                     yield new ModelSelection("step", value, true);
@@ -2844,7 +3116,9 @@ public class Main {
         ));
         if (info.note() != null && !info.note().isBlank()) {
             lines.add("");
-            lines.add(AnsiStyle.subtle(info.note().replace('\n', ' ')));
+            for (String line : TerminalTable.wrap(info.note().strip(), terminalColumns()).split("\n")) {
+                lines.add(AnsiStyle.subtle(line));
+            }
         }
         return lines;
     }
@@ -2866,24 +3140,7 @@ public class Main {
         return new McpConfigBootstrapResult(false, "");
     }
 
-    private static MemorySaveRequest parseMemorySave(String raw) {
-        String value = raw == null ? "" : raw.trim();
-        if (value.regionMatches(true, 0, "--global ", 0, 9)) {
-            return new MemorySaveRequest(value.substring(9).trim(), "global");
-        }
-        if (value.equalsIgnoreCase("--global")) {
-            return new MemorySaveRequest("", "global");
-        }
-        if (value.regionMatches(true, 0, "--project ", 0, 10)) {
-            return new MemorySaveRequest(value.substring(10).trim(), "project");
-        }
-        if (value.equalsIgnoreCase("--project")) {
-            return new MemorySaveRequest("", "project");
-        }
-        return new MemorySaveRequest(value, "project");
-    }
-
-    private static String formatMemoryEntries(String title, List<MemoryEntry> entries) {
+    private static String formatMemoryEntries(String title, List<MemoryEntry> entries, MemoryManager memoryManager) {
         StringBuilder sb = new StringBuilder(title).append("：\n");
         if (entries == null || entries.isEmpty()) {
             return sb.append("📭 没有匹配的长期记忆。").toString();
@@ -2897,8 +3154,24 @@ public class Main {
             if ("project".equals(scope) && project != null && !project.isBlank()) {
                 sb.append(" ").append(shortenPath(project));
             }
-            sb.append(" · ").append(entry.getTimestamp()).append("\n")
-                    .append("  ").append(entry.getContent()).append("\n");
+            sb.append(" · 写入 ").append(entry.getTimestamp());
+            if ("true".equals(entry.getMetadata().get("verification_pending"))) {
+                sb.append(" · 尚未经用户核实");
+            } else {
+                sb.append(" · 最后核实 ").append(entry.getLastVerifiedAt());
+            }
+            if (memoryManager.isStale(entry)) {
+                sb.append(" · ⚠️ 可能已过时");
+            }
+            if ("true".equals(entry.getMetadata().get("verification_pending"))) {
+                sb.append(" · 🔎 自动提取，待核实");
+            }
+            if ("true".equals(entry.getMetadata().get(ExternalContextTracker.METADATA_FLAG))) {
+                sb.append(" · 🌐 写入时会话含外部内容(")
+                        .append(entry.getMetadata().getOrDefault(ExternalContextTracker.METADATA_SOURCES, ""))
+                        .append(")");
+            }
+            sb.append("\n").append("  ").append(entry.getContent()).append("\n");
         }
         return sb.toString().trim();
     }
@@ -2932,6 +3205,4 @@ public class Main {
         }
     }
 
-    private record MemorySaveRequest(String fact, String scope) {
-    }
 }

@@ -12,6 +12,20 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 class LlmClientFactoryTest {
 
     @Test
+    void freshConfigPrefersDeepSeekFlash() {
+        PaiCliConfig config = new PaiCliConfig();
+        config.getProviders().put("glm", new PaiCliConfig.ProviderConfig("test-glm-key", null, null));
+        config.getProviders().put("deepseek", new PaiCliConfig.ProviderConfig("test-deepseek-key", null, null));
+
+        LlmClient client = LlmClientFactory.createFromConfig(config);
+
+        assertEquals("deepseek", config.getDefaultProvider());
+        // 具体模型可能被本机 .env 的 DEEPSEEK_MODEL 覆盖，这里只断言选中的 provider
+        assertInstanceOf(DeepSeekClient.class, client);
+        assertEquals("deepseek", client.getProviderName());
+    }
+
+    @Test
     void createsGlm5vTurboClientWithMultimodalEndpoint() {
         PaiCliConfig config = new PaiCliConfig();
         config.getProviders().put("glm",
@@ -38,6 +52,28 @@ class LlmClientFactoryTest {
         assertEquals("step-3.5-flash-2603", stepClient.getModelName());
         assertEquals(256_000, stepClient.maxContextWindow());
         assertEquals(expectedStepChatUrl(config.getBaseUrl("step")), stepClient.getApiUrl());
+    }
+
+    @Test
+    void createsHunyuanClientFromHy4AliasAndConfiguredProvider() {
+        PaiCliConfig config = new PaiCliConfig();
+        config.getProviders().put("hunyuan",
+                new PaiCliConfig.ProviderConfig(
+                        "test-hunyuan-key",
+                        "https://tokenhub.tencentmaas.com/v1",
+                        "hy4-preview"));
+
+        LlmClient client = LlmClientFactory.create("hy4", config);
+        LlmClient previewAliasClient = LlmClientFactory.create("hy4-preview", config);
+
+        HunyuanClient hunyuanClient = assertInstanceOf(HunyuanClient.class, client);
+        assertInstanceOf(HunyuanClient.class, previewAliasClient);
+        assertEquals("hunyuan", hunyuanClient.getProviderName());
+        assertEquals("hy4-preview", hunyuanClient.getModelName());
+        assertEquals("https://tokenhub.tencentmaas.com/v1/chat/completions", hunyuanClient.getApiUrl());
+        assertEquals(1_000_000, hunyuanClient.maxContextWindow());
+        assertEquals(false, hunyuanClient.supportsImageInput());
+        assertEquals(true, hunyuanClient.supportsPromptCaching());
     }
 
     @Test

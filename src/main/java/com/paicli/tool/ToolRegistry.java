@@ -9,6 +9,7 @@ import com.paicli.browser.BrowserCheckResult;
 import com.paicli.browser.BrowserConnector;
 import com.paicli.browser.BrowserGuard;
 import com.paicli.context.ContextProfile;
+import com.paicli.memory.ExternalContextTracker;
 import com.paicli.lsp.LspDiagnosticReport;
 import com.paicli.lsp.LspManager;
 import com.paicli.mcp.protocol.McpToolDescriptor;
@@ -23,7 +24,6 @@ import com.paicli.runtime.CancellationContext;
 import com.paicli.snapshot.RestoreResult;
 import com.paicli.snapshot.SnapshotService;
 import com.paicli.skill.Skill;
-import com.paicli.skill.SkillContextBuffer;
 import com.paicli.skill.SkillRegistry;
 import com.paicli.web.FetchResult;
 import com.paicli.web.HtmlExtractor;
@@ -62,6 +62,8 @@ public class ToolRegistry {
     private static final int DEFAULT_TOOL_BATCH_TIMEOUT_SECONDS = 90;
     private static final int MAX_PARALLEL_TOOLS = 4;
     private static final int MAX_COMMAND_OUTPUT_CHARS = 8_000;
+    // 开启工具输出卸载时，命令输出先完整捕获到这个上限，超过 MAX_COMMAND_OUTPUT_CHARS 的部分写入会话文件而不是丢弃。
+    private static final int MAX_COMMAND_CAPTURE_CHARS = 2_000_000;
     private static final int MAX_READ_FILE_LINES = 2_000;
     private static final int MAX_GREP_RESULTS = 200;
     private static final int MAX_GREP_CONTEXT_LINES = 5;
@@ -74,11 +76,11 @@ public class ToolRegistry {
     private static final Set<String> SEARCH_EXCLUDED_DIRS = Set.of(
             ".git", ".paicli", "target", "node_modules", "dist", "build", "coverage", ".idea", ".gradle"
     );
-    // write_file 单次写入字节数上限。LLM 想塞超大内容时通常是误生成（重复粘贴 / hallucinate 大段日志），
+    // write_file / edit_file 单次写入字节数上限。LLM 想塞超大内容时通常是误生成（重复粘贴 / hallucinate 大段日志），
     // 5MB 对常规代码生成 / 文档撰写完全够用，超过即拒，避免磁盘灌满与误覆盖。
     private static final int MAX_WRITE_FILE_BYTES = 5 * 1024 * 1024;
     // 需要审计的内置工具（与 ApprovalPolicy 的 DANGEROUS_TOOLS 保持一致）；MCP 工具按前缀动态纳入审计。
-    private static final Set<String> AUDIT_TOOLS = Set.of("write_file", "execute_command", "create_project", "revert_turn");
+    private static final Set<String> AUDIT_TOOLS = Set.of("write_file", "edit_file", "execute_command", "create_project", "revert_turn");
     private final Map<String, Tool> tools = new ConcurrentHashMap<>();
     private final Map<String, McpRegisteredTool> mcpTools = new ConcurrentHashMap<>();
     private final long commandTimeoutSeconds;
@@ -94,13 +96,23 @@ public class ToolRegistry {
     private ContextProfile contextProfile = ContextProfile.from(null);
     private BrowserGuard browserGuard;
     private BrowserConnector browserConnector;
-    private BiConsumer<String, String> memorySaver;
+    private MemoryWriter memoryWriter;
+    private final ExternalContextTracker externalContextTracker = ExternalContextTracker.fromConfiguration();
     private SkillRegistry skillRegistry;
-    private SkillContextBuffer skillContextBuffer;
     private java.util.function.BiConsumer<String, String[]> writeFileObserver = (p, ba) -> {};
     private LspManager lspManager = new LspManager(projectPath);
     private SnapshotService snapshotService = SnapshotService.forProject(Path.of(projectPath));
     private boolean customSnapshotService;
+    private ToolResultOffloader toolResultOffloader = ToolResultOffloader.fromConfiguration(Path.of(projectPath));
+    private boolean sanitizeCommandEnvironment;
+    private volatile CommandSandbox commandSandbox;
+    /** 交互式沙箱模式；null 表示未经 {@link #configureCommandSandbox} 配置（例如基准评测入口）。 */
+    private volatile CommandSandboxMode commandSandboxMode;
+    /** REQUIRED 模式下沙箱不可用的原因；非 null 时 execute_command 拒绝执行。 */
+    private volatile String commandSandboxRequiredFailure;
+    private volatile CommandExecutionObserver commandExecutionObserver;
+    private final java.util.concurrent.atomic.AtomicLong commandInvocationIds = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong commandObservationFailures = new java.util.concurrent.atomic.AtomicLong();
     private volatile String currentProvider = "";
     private volatile String currentModel = "";
 
@@ -134,6 +146,11 @@ public class ToolRegistry {
         this.projectPath = projectPath;
         this.pathGuard = new PathGuard(projectPath);
         this.lspManager.setProjectPath(projectPath);
+        this.toolResultOffloader.setProjectRoot(Path.of(projectPath));
+        CommandSandboxMode sandboxMode = commandSandboxMode;
+        if (sandboxMode != null && sandboxMode != CommandSandboxMode.OFF) {
+            configureCommandSandbox(sandboxMode, Path.of(projectPath));
+        }
         if (!customSnapshotService) {
             this.snapshotService.close();
             this.snapshotService = SnapshotService.forProject(Path.of(projectPath));
@@ -145,6 +162,55 @@ public class ToolRegistry {
      */
     public String getProjectPath() {
         return projectPath;
+    }
+
+    /**
+     * Removes credential-like variables from child processes launched by
+     * {@code execute_command}. This is opt-in so normal interactive sessions keep
+     * their existing environment behavior, while unattended benchmark workers can
+     * prevent model-authentication credentials from leaking into evaluated shells.
+     */
+    public void setSanitizeCommandEnvironment(boolean sanitizeCommandEnvironment) {
+        this.sanitizeCommandEnvironment = sanitizeCommandEnvironment;
+    }
+
+    /** Optional diagnostics only; observer exceptions never change command policy or results. */
+    public void setCommandExecutionObserver(CommandExecutionObserver observer) {
+        this.commandExecutionObserver = observer;
+    }
+
+    public long getCommandObservationFailures() {
+        return commandObservationFailures.get();
+    }
+
+    /**
+     * Enables fail-closed macOS subprocess isolation for {@code execute_command}.
+     * The sandbox can write only below {@code workspaceRoot}, cannot use the
+     * network, and receives isolated HOME/TMPDIR directories below that root.
+     * Normal interactive behavior is unchanged until this method is called.
+     */
+    public void setCommandSandboxRoot(Path workspaceRoot) {
+        this.commandSandbox = CommandSandbox.enable(workspaceRoot);
+    }
+
+    /**
+     * 交互式 PaiCLI 的沙箱入口：按模式探测 macOS Seatbelt / Linux bubblewrap。
+     * AUTO 不可用时回退为直接执行；REQUIRED 不可用时 execute_command 拒绝执行；OFF 与旧行为一致。
+     * 项目根切换时会按同一模式重新配置。
+     */
+    public CommandSandboxStatus configureCommandSandbox(CommandSandboxMode mode, Path workspaceRoot) {
+        return applyCommandSandbox(mode, CommandSandboxDetector.activate(mode, workspaceRoot));
+    }
+
+    CommandSandboxStatus applyCommandSandbox(CommandSandboxMode mode, CommandSandboxDetector.Activation activation) {
+        this.commandSandboxMode = mode == null ? CommandSandboxMode.OFF : mode;
+        this.commandSandbox = activation.sandbox();
+        this.commandSandboxRequiredFailure = activation.requiredFailure();
+        return activation.status();
+    }
+
+    boolean isCommandSandboxEnabled() {
+        return commandSandbox != null;
     }
 
     public void setContextProfile(ContextProfile contextProfile) {
@@ -170,16 +236,43 @@ public class ToolRegistry {
         return browserGuard;
     }
 
+    public boolean isSharedBrowserSession() {
+        return browserGuard != null && browserGuard.isSharedMode();
+    }
+
+    public boolean hasAgentOwnedCurrentBrowserPage() {
+        return browserGuard != null && browserGuard.hasAgentOwnedCurrentPage();
+    }
+
     public void setBrowserConnector(BrowserConnector browserConnector) {
         this.browserConnector = browserConnector;
     }
 
     public void setMemorySaver(Consumer<String> memorySaver) {
-        this.memorySaver = memorySaver == null ? null : (fact, scope) -> memorySaver.accept(fact);
+        this.memoryWriter = memorySaver == null ? null : (fact, scope, replaceId, keepBoth) -> {
+            memorySaver.accept(fact);
+            return null;
+        };
     }
 
     public void setScopedMemorySaver(BiConsumer<String, String> memorySaver) {
-        this.memorySaver = memorySaver;
+        this.memoryWriter = memorySaver == null ? null : (fact, scope, replaceId, keepBoth) -> {
+            memorySaver.accept(fact, scope);
+            return null;
+        };
+    }
+
+    /** 注入带冲突反馈的记忆写入器；返回值会作为 save_memory 的工具结果回给模型。 */
+    public void setMemoryWriter(MemoryWriter memoryWriter) {
+        this.memoryWriter = memoryWriter;
+    }
+
+    /**
+     * 会话级外部内容标记：TurnToolPolicy 在 Web / 浏览器 / MCP / curl 结果进入上下文后写入，
+     * MemoryManager 据此在显式保存的记忆 metadata 里标注来源，并阻止自动写记忆。
+     */
+    public ExternalContextTracker getExternalContextTracker() {
+        return externalContextTracker;
     }
 
     public void setSkillRegistry(SkillRegistry skillRegistry) {
@@ -190,22 +283,25 @@ public class ToolRegistry {
         return skillRegistry;
     }
 
-    public void setSkillContextBuffer(SkillContextBuffer skillContextBuffer) {
-        this.skillContextBuffer = skillContextBuffer;
-    }
-
-    public SkillContextBuffer getSkillContextBuffer() {
-        return skillContextBuffer;
-    }
-
     /**
-     * 注册 write_file 写入观察者：参数 (path, [before, after])，
+     * 注册 write_file / edit_file 写入观察者：参数 (path, [before, after])，
      * before == null 表示新建文件或读不出原文。
-     * 用于把 write_file 接到行内 diff 渲染等只读副作用里；
-     * 观察者抛异常不影响 write_file 主路径。
+     * 用于把文件修改接到行内 diff 渲染等只读副作用里；
+     * 观察者抛异常不影响文件修改主路径。
      */
     public void setWriteFileObserver(java.util.function.BiConsumer<String, String[]> observer) {
         this.writeFileObserver = observer == null ? (p, ba) -> {} : observer;
+    }
+
+    public void setToolResultOffloader(ToolResultOffloader toolResultOffloader) {
+        if (toolResultOffloader != null) {
+            toolResultOffloader.setProjectRoot(Path.of(projectPath));
+            this.toolResultOffloader = toolResultOffloader;
+        }
+    }
+
+    public ToolResultOffloader getToolResultOffloader() {
+        return toolResultOffloader;
     }
 
     public void setLspManager(LspManager lspManager) {
@@ -293,6 +389,20 @@ public class ToolRegistry {
                 }
         ));
 
+        tools.put("edit_file", new Tool(
+                "edit_file",
+                "精确替换项目内已有文件里的文本，无需输出整个文件。old_text 要和文件内容一致（含缩进），"
+                        + "默认必须恰好匹配一处，匹配多处时报错并给出所在行；replace_all=true 时替换全部匹配。"
+                        + "片段来自记忆或较早的读取时，先用 read_file 重新读取。新建文件用 write_file",
+                createParameters(
+                        new Param("path", "string", "已有文件路径", true),
+                        new Param("old_text", "string", "要替换的原文片段，默认必须唯一匹配", true),
+                        new Param("new_text", "string", "替换后的文本；空字符串表示删除原文片段", true),
+                        new Param("replace_all", "boolean", "为 true 时替换 old_text 的所有匹配，默认 false", false)
+                ),
+                this::editFile
+        ));
+
         // list_dir 工具
         tools.put("list_dir", new Tool(
                 "list_dir",
@@ -345,6 +455,43 @@ public class ToolRegistry {
                 ),
                 args -> grepCode(args)
         ));
+    }
+
+    private String editFile(Map<String, String> args) {
+        String path = args.get("path");
+        String oldText = args.get("old_text");
+        String newText = args.get("new_text");
+        boolean replaceAll = Boolean.parseBoolean(args.get("replace_all"));
+        if (oldText == null || oldText.isEmpty() || newText == null) {
+            throw new IllegalArgumentException("old_text 必须非空，new_text 必须提供");
+        }
+        Path safe = pathGuard.resolveSafe(path);
+        if (!Files.isRegularFile(safe)) {
+            throw new IllegalArgumentException("目标不是已有的普通文件: " + path);
+        }
+        try {
+            String before = Files.readString(safe, StandardCharsets.UTF_8);
+            TextEditMatcher.Result edit = TextEditMatcher.apply(before, oldText, newText, replaceAll, path);
+            String after = edit.content();
+            if (after.equals(before)) {
+                throw new IllegalArgumentException("替换前后内容相同，文件未修改: " + path);
+            }
+            int contentBytes = after.getBytes(StandardCharsets.UTF_8).length;
+            if (contentBytes > MAX_WRITE_FILE_BYTES) {
+                throw new PolicyException("编辑后文件 " + contentBytes + " 字节超过 "
+                        + (MAX_WRITE_FILE_BYTES / 1024 / 1024) + "MB 上限");
+            }
+            Files.writeString(safe, after, StandardCharsets.UTF_8);
+            try {
+                writeFileObserver.accept(path, new String[]{before, after});
+            } catch (Exception ignored) {
+                // diff 展示失败不影响已完成的文件编辑
+            }
+            runPostEditLspHook(path, safe);
+            return replaceAll ? "文件已编辑: " + path + "（替换 " + edit.replacements() + " 处）" : "文件已编辑: " + path;
+        } catch (IOException e) {
+            throw new IllegalStateException("编辑文件失败: " + e.getMessage(), e);
+        }
     }
 
     private String readFileForTool(Path file, Map<String, String> args) throws IOException {
@@ -619,7 +766,7 @@ public class ToolRegistry {
         tools.put("web_search", new Tool(
                 "web_search",
                 "搜索互联网，获取实时信息（最新版本、官方文档、技术资讯等）。" +
-                        "支持 SerpAPI（默认）和 SearXNG（自托管）两种 provider，由 SEARCH_PROVIDER 环境变量切换。",
+                        "provider 按配置自动选择：智谱、SerpAPI、自托管 SearXNG、DeepSeek（包含独立模型调用），SEARCH_PROVIDER 可显式指定。",
                 createParameters(
                         new Param("query", "string", "搜索关键词，例如'Java 21 新特性'、'Spring Boot 3.3 release notes'", true),
                         new Param("top_k", "integer", "返回结果数量（默认5）", false)
@@ -629,10 +776,10 @@ public class ToolRegistry {
 
         tools.put("web_fetch", new Tool(
                 "web_fetch",
-                "抓取指定 URL，提取正文转 Markdown。" +
+                "抓取当前顶层用户原文提供或本执行分支成功 web_search 结果发现的 URL，提取正文转 Markdown；不得使用模型猜测的 URL。" +
                         "适用静态 / SSR 页面（博客、文档、官网）；JS 渲染或防爬站会返回空正文，本期不重试。",
                 createParameters(
-                        new Param("url", "string", "完整 URL，需 http 或 https 协议", true),
+                        new Param("url", "string", "有可信来源的完整 URL，需 http 或 https 协议", true),
                         new Param("max_chars", "integer", "返回 Markdown 最大字符数（默认 8000，超出截断）", false)
                 ),
                 args -> webFetch(args.get("url"), parseInt(args.get("max_chars"), DEFAULT_FETCH_MAX_CHARS))
@@ -669,7 +816,7 @@ public class ToolRegistry {
     private void registerSkillTools() {
         tools.put("load_skill", new Tool(
                 "load_skill",
-                "Load full SKILL.md instructions for a skill the system has indexed (see the \"可用 Skills\" section in this system prompt). Call this when a skill's description matches the current task. Pass the exact kebab-case skill name. The full body will appear at the start of your next user message under \"## 已加载 Skill：<name>\". Don't reload the same skill twice in one session.",
+                "Load full SKILL.md instructions for a skill the system has indexed (see the \"可用 Skills\" section in this system prompt). Call this when a skill's description matches the current task. Pass the exact kebab-case skill name. The full body is appended right after this tool result, before your next step in the same turn, under \"## 已加载 Skill：<name>\". Don't reload the same skill twice in one session.",
                 createParameters(new Param("name", "string", "the exact kebab-case skill name (e.g. web-access)", true)),
                 args -> {
                     String name = args.get("name");
@@ -687,19 +834,10 @@ public class ToolRegistry {
                         }
                         return "Skill '" + name + "' 已被禁用，可用 /skill on " + name + " 启用";
                     }
-                    String body = skill.body();
-                    int originalLen = body == null ? 0 : body.length();
-                    int max = 5 * 1024;
-                    String injected = body == null ? "" : body;
-                    if (injected.length() > max) {
-                        injected = injected.substring(0, max)
-                                + "\n\n...(skill body truncated, full content via /skill show " + name + ")";
-                    }
-                    if (skillContextBuffer != null) {
-                        skillContextBuffer.push(name, injected);
-                    }
+                    // 正文由调用方通过 LoadedSkillMessages 紧跟在本结果之后注入，这里只返回确认
+                    int originalLen = skill.body() == null ? 0 : skill.body().length();
                     return "已加载 skill '" + name + "' 的完整指引（" + originalLen
-                            + " bytes），将在下一轮上下文中以 \"## 已加载 Skill：" + name + "\" 段出现。";
+                            + " 字符），正文紧跟在本工具结果之后，以 \"## 已加载 Skill：" + name + "\" 段出现。";
                 }
         ));
     }
@@ -707,23 +845,31 @@ public class ToolRegistry {
     private void registerMemoryTools() {
         tools.put("save_memory", new Tool(
                 "save_memory",
-                "当且仅当用户明确说“记一下”“记住”“以后记得”或要求保存长期偏好/稳定事实时调用，把精炼事实写入长期记忆；scope 默认 project，跨项目偏好才用 global；不要保存一次性任务请求、临时文件名或模型猜测。",
+                "当且仅当用户明确说“记一下”“记住”“以后记得”或要求保存长期偏好/稳定事实时调用，把精炼事实写入长期记忆；scope 默认 project，跨项目偏好才用 global；不要保存一次性任务请求、临时文件名或模型猜测。"
+                        + "如果结果提示与已有记忆冲突，把两条都告诉用户并等待用户选择；只有用户明确选择后才可传 replace_id 或 keep_both 重新调用。",
                 createParameters(
                         new Param("fact", "string", "要长期保存的稳定事实或用户偏好，必须精炼、可跨会话复用", true),
-                        new Param("scope", "string", "记忆作用域：project 或 global。默认 project；跨项目长期偏好才用 global", false)
+                        new Param("scope", "string", "记忆作用域：project 或 global。默认 project；跨项目长期偏好才用 global", false),
+                        new Param("replace_id", "string", "仅当用户明确选择用新内容替换某条冲突记忆时，传该旧记忆 id", false),
+                        new Param("keep_both", "boolean", "仅当用户明确要求冲突的新旧两条都保留时传 true", false)
                 ),
                 args -> {
                     String fact = args.get("fact");
                     if (fact == null || fact.isBlank()) {
                         return "保存长期记忆失败: fact 不能为空";
                     }
-                    if (memorySaver == null) {
+                    if (memoryWriter == null) {
                         return "保存长期记忆失败: 记忆保存器未初始化";
                     }
                     String normalized = fact.trim();
                     String scope = "global".equalsIgnoreCase(args.get("scope")) ? "global" : "project";
-                    memorySaver.accept(normalized, scope);
-                    return "💾 已保存到长期记忆(" + scope + "): " + normalized;
+                    String replaceId = args.get("replace_id");
+                    boolean keepBoth = parseBoolean(args.get("keep_both"), false);
+                    String message = memoryWriter.write(normalized, scope,
+                            replaceId == null || replaceId.isBlank() ? null : replaceId.trim(), keepBoth);
+                    return message == null || message.isBlank()
+                            ? "💾 已保存到长期记忆(" + scope + "): " + normalized
+                            : message;
                 }
         ));
     }
@@ -823,6 +969,27 @@ public class ToolRegistry {
         return searchProvider;
     }
 
+    void setSearchProvider(SearchProvider searchProvider) {
+        this.searchProvider = Objects.requireNonNull(searchProvider, "searchProvider");
+    }
+
+    /**
+     * Trusted embedding seam for an offline transport. Install the complete set before any Web use;
+     * normal CLI construction retains the production providers and network policy. Not a model tool.
+     */
+    protected final synchronized void installWebDependencies(SearchProvider search, WebFetcher fetcher,
+                                                              NetworkPolicy policy) {
+        Objects.requireNonNull(search, "search");
+        Objects.requireNonNull(fetcher, "fetcher");
+        Objects.requireNonNull(policy, "policy");
+        if (searchProvider != null || webFetcher != null || networkPolicy != null) {
+            throw new IllegalStateException("Web dependencies already initialized");
+        }
+        searchProvider = search;
+        webFetcher = fetcher;
+        networkPolicy = policy;
+    }
+
     private synchronized WebFetcher webFetcher() {
         if (webFetcher == null) {
             webFetcher = new WebFetcher();
@@ -845,8 +1012,12 @@ public class ToolRegistry {
     }
 
     String webSearch(String query, int topK) {
+        return webSearchOutput(query, topK).text();
+    }
+
+    private ToolOutput webSearchOutput(String query, int topK) {
         if (query == null || query.isBlank()) {
-            return "搜索关键词不能为空";
+            return ToolOutput.failure("搜索关键词不能为空");
         }
         if (shouldPreferStepSearch() && tools.containsKey(STEP_SEARCH_TOOL)) {
             ObjectNode args = mapper.createObjectNode();
@@ -855,18 +1026,43 @@ public class ToolRegistry {
                     "top_k", "topK", "max_results", "num_results", "limit", "count");
             ToolOutput output = executeToolOutput(STEP_SEARCH_TOOL, args.toString());
             if (isUsableMcpOutput(output)) {
-                return "🔍 [StepSearch] " + query.trim() + "\n\n" + output.text().trim();
+                // StepSearch currently returns unstructured MCP prose. Keep it
+                // useful as search text, but do not mint URL authority from it.
+                return ToolOutput.text(
+                        "🔍 [StepSearch] " + query.trim() + "\n\n" + output.text().trim());
             }
         }
         SearchProvider provider = searchProvider();
         if (!provider.isReady()) {
-            return "⚠️ " + provider.unavailableHint();
+            return ToolOutput.failure("⚠️ " + provider.unavailableHint());
         }
         try {
             List<SearchResult> results = provider.search(query.trim(), topK);
-            return formatSearchResults(provider.name(), query, results);
+            List<String> discoveredUrls = results == null
+                    ? List.of()
+                    : results.stream()
+                    .map(SearchResult::url)
+                    .filter(ToolRegistry::isHttpUrl)
+                    .distinct()
+                    .toList();
+            return ToolOutput.discovered(
+                    formatSearchResults(provider.name(), query, results), discoveredUrls);
         } catch (Exception e) {
-            return "搜索失败 (" + provider.name() + "): " + e.getMessage();
+            return ToolOutput.failure("搜索失败 (" + provider.name() + "): " + e.getMessage());
+        }
+    }
+
+    private static boolean isHttpUrl(String value) {
+        if (value == null || value.isBlank()) {
+            return false;
+        }
+        try {
+            java.net.URI uri = java.net.URI.create(value.trim());
+            return ("http".equalsIgnoreCase(uri.getScheme())
+                    || "https".equalsIgnoreCase(uri.getScheme()))
+                    && uri.getHost() != null;
+        } catch (IllegalArgumentException e) {
+            return false;
         }
     }
 
@@ -970,7 +1166,8 @@ public class ToolRegistry {
     }
 
     private boolean isUsableMcpOutput(ToolOutput output) {
-        if (output == null || output.text() == null || output.text().isBlank()) {
+        if (output == null || !output.successful()
+                || output.text() == null || output.text().isBlank()) {
             return false;
         }
         String text = output.text().trim();
@@ -1026,6 +1223,7 @@ public class ToolRegistry {
      */
     public List<com.paicli.llm.LlmClient.Tool> getToolDefinitions() {
         return tools.values().stream()
+                .sorted(Comparator.comparing(Tool::name))
                 .map(t -> new com.paicli.llm.LlmClient.Tool(t.name(), t.description(), t.parameters()))
                 .toList();
     }
@@ -1092,7 +1290,7 @@ public class ToolRegistry {
     /**
      * 执行工具调用
      *
-     * 危险工具（write_file / execute_command / create_project）会写一行审计：
+     * 危险工具（write_file / edit_file / execute_command / create_project / revert_turn）会写一行审计：
      * - 策略拦截（PathGuard / CommandGuard / 文件大小上限）→ deny
      * - 普通异常 → error
      * - 其他情况 → allow（仅表示工具调用真的发生过，工具内部的业务错误仍以返回字符串呈现给 LLM）
@@ -1103,18 +1301,18 @@ public class ToolRegistry {
 
     public ToolOutput executeToolOutput(String name, String argumentsJson) {
         if (isLegacyExecuteToolOverride()) {
-            return ToolOutput.text(executeTool(name, argumentsJson));
+            return classifyTextOutput(executeTool(name, argumentsJson));
         }
         return doExecuteTool(name, argumentsJson);
     }
 
     protected ToolOutput doExecuteTool(String name, String argumentsJson) {
         if (CancellationContext.isCancelled()) {
-            return ToolOutput.text("用户取消了此次工具调用");
+            return ToolOutput.failure("用户取消了此次工具调用");
         }
         Tool tool = tools.get(name);
         if (tool == null) {
-            return ToolOutput.text("未知工具: " + name);
+            return ToolOutput.failure("未知工具: " + name);
         }
 
         boolean shouldAudit = shouldAudit(name);
@@ -1133,8 +1331,20 @@ public class ToolRegistry {
                 if (output == null) {
                     output = ToolOutput.text("");
                 }
+                output = classifyOutput(output);
                 if (browserGuard != null) {
-                    browserGuard.applyAfterExecution(name, argumentsJson, output.text());
+                    String rawText = output.text();
+                    browserGuard.applyAfterExecution(
+                            name, argumentsJson, rawText, output.successful());
+                    String safeText = browserGuard.sanitizeResult(
+                            name, argumentsJson, rawText, output.successful());
+                    if (!safeText.equals(rawText)) {
+                        output = new ToolOutput(
+                                safeText,
+                                output.imageParts(),
+                                output.successful(),
+                                output.discoveredUrls());
+                    }
                 }
                 if (shouldAudit) {
                     auditLog.record(AuditLog.AuditEntry.allow(name, argumentsJson, elapsedMillis(start), auditMetadata));
@@ -1146,24 +1356,68 @@ public class ToolRegistry {
             Map<String, String> argMap = new HashMap<>();
             args.fields().forEachRemaining(entry ->
                     argMap.put(entry.getKey(), entry.getValue().asText()));
-            String result = tool.executor().execute(argMap);
+            ToolOutput output;
+            if ("web_search".equals(name)) {
+                output = webSearchOutput(argMap.get("query"), parseInt(argMap.get("top_k"), 5));
+            } else if ("execute_command".equals(name)) {
+                output = executeCommandOutput(argMap.get("command"));
+            } else {
+                output = classifyTextOutput(tool.executor().execute(argMap));
+            }
             if (shouldAudit) {
                 auditLog.record(AuditLog.AuditEntry.allow(name, argumentsJson, elapsedMillis(start), auditMetadata));
             }
-            return ToolOutput.text(result);
+            return output;
         } catch (PolicyException e) {
             if (shouldAudit) {
                 auditLog.record(AuditLog.AuditEntry.denyByPolicy(
                         name, argumentsJson, e.getMessage(), elapsedMillis(start), auditMetadata));
             }
-            return ToolOutput.text("🛡️ 策略拒绝: " + e.getMessage());
+            return ToolOutput.failure("🛡️ 策略拒绝: " + e.getMessage());
         } catch (Exception e) {
             if (shouldAudit) {
                 auditLog.record(AuditLog.AuditEntry.error(
                         name, argumentsJson, e.getMessage(), elapsedMillis(start), auditMetadata));
             }
-            return ToolOutput.text("工具执行失败: " + e.getMessage());
+            return ToolOutput.failure("工具执行失败: " + e.getMessage());
         }
+    }
+
+    private static ToolOutput classifyTextOutput(String text) {
+        return looksLikeFailureText(text) ? ToolOutput.failure(text) : ToolOutput.text(text);
+    }
+
+    private static ToolOutput classifyOutput(ToolOutput output) {
+        if (output == null) {
+            return ToolOutput.text("");
+        }
+        if (!output.successful() || !looksLikeFailureText(output.text())) {
+            return output;
+        }
+        return ToolOutput.failure(output.text(), output.imageParts());
+    }
+
+    private static boolean looksLikeFailureText(String text) {
+        if (text == null) {
+            return false;
+        }
+        String value = text.stripLeading();
+        return value.startsWith("🛡️")
+                || value.startsWith("❌")
+                || value.startsWith("[HITL]")
+                || value.startsWith("[AUTO]")
+                || value.startsWith("用户取消了")
+                || value.startsWith("工具执行失败")
+                || value.startsWith("工具执行超时")
+                || value.startsWith("未知工具")
+                || value.startsWith("MCP 工具返回错误")
+                || value.startsWith("MCP 工具调用失败")
+                || value.startsWith("搜索关键词不能为空")
+                || value.startsWith("搜索失败")
+                || value.startsWith("抓取失败")
+                || value.startsWith("URL 不能为空")
+                || value.startsWith("⚠️ 搜索")
+                || value.startsWith("浏览器连接器未初始化");
     }
 
     private boolean isLegacyExecuteToolOverride() {
@@ -1188,10 +1442,23 @@ public class ToolRegistry {
     }
 
     /**
-     * 并行执行同一轮 LLM 返回的多个工具调用。
+     * Completion hook for the whole TurnToolPolicy batch, including pre-registry denials.
+     * Results are immutable and in the original invocation order; this does not execute tools.
+     * The default is a no-op. Evidence consumers must use this boundary instead of observing
+     * only executeTools(), which receives the policy-authorized subset.
+     */
+    public void onPolicyToolResults(List<ToolExecutionResult> results) {
+    }
+
+    /**
+     * 执行同一轮 LLM 返回的多个工具调用。
      *
      * 结果按传入顺序返回，调用方可以安全地按原 tool_call 顺序回灌消息历史。
-     * 如果某个工具超过批次超时仍未返回，会取消任务并返回超时结果；已完成工具不受影响。
+     * 只有无副作用的只读工具（{@link #PARALLEL_SAFE_TOOLS}）才会并行；写文件、执行命令、
+     * MCP、记忆写入、回滚和未知工具都按原顺序逐个串行，避免同一文件的并发 edit_file
+     * 互相覆盖（读-改-写丢更新）或命令与写入交错。连续的只读调用组成一段并行执行，
+     * 遇到有副作用的调用先等前面的只读段结束，再单独执行它，保持模型给出的先后语义。
+     * 含浏览器工具的批次整体串行，避免同一浏览器会话内的页面状态互相覆盖。
      */
     public List<ToolExecutionResult> executeTools(List<ToolInvocation> invocations) {
         if (invocations == null || invocations.isEmpty()) {
@@ -1202,13 +1469,61 @@ public class ToolRegistry {
                     .map(invocation -> ToolExecutionResult.failed(invocation, "用户取消了此次工具调用"))
                     .toList();
         }
-        if (invocations.size() == 1) {
-            ToolInvocation invocation = invocations.get(0);
-            long startedAt = System.nanoTime();
-            ToolOutput output = executeToolOutput(invocation.name(), invocation.argumentsJson());
-            return List.of(ToolExecutionResult.completed(invocation, output, elapsedMillis(startedAt)));
+        if (invocations.size() == 1
+                || invocations.stream().anyMatch(invocation -> TurnToolPolicy.isBrowserToolName(invocation.name()))) {
+            return executeSerially(invocations);
+        }
+        if (invocations.stream().allMatch(invocation -> isParallelSafeTool(invocation.name()))) {
+            return executeInParallel(invocations);
         }
 
+        List<ToolExecutionResult> results = new ArrayList<>(invocations.size());
+        List<ToolInvocation> readOnlyRun = new ArrayList<>();
+        for (ToolInvocation invocation : invocations) {
+            if (isParallelSafeTool(invocation.name())) {
+                readOnlyRun.add(invocation);
+                continue;
+            }
+            results.addAll(flushReadOnlyRun(readOnlyRun));
+            results.addAll(executeSerially(List.of(invocation)));
+        }
+        results.addAll(flushReadOnlyRun(readOnlyRun));
+        return results;
+    }
+
+    /** 无副作用、可以和同类调用并行的内置工具；不在名单里的一律串行。 */
+    static final Set<String> PARALLEL_SAFE_TOOLS = Set.of(
+            "read_file", "list_dir", "glob_files", "grep_code", "search_code",
+            "web_search", "web_fetch", "load_skill");
+
+    static boolean isParallelSafeTool(String toolName) {
+        return toolName != null && PARALLEL_SAFE_TOOLS.contains(toolName);
+    }
+
+    private List<ToolExecutionResult> flushReadOnlyRun(List<ToolInvocation> readOnlyRun) {
+        if (readOnlyRun.isEmpty()) {
+            return List.of();
+        }
+        List<ToolInvocation> run = List.copyOf(readOnlyRun);
+        readOnlyRun.clear();
+        return run.size() == 1 ? executeSerially(run) : executeInParallel(run);
+    }
+
+    private List<ToolExecutionResult> executeSerially(List<ToolInvocation> invocations) {
+        List<ToolExecutionResult> results = new ArrayList<>(invocations.size());
+        for (ToolInvocation invocation : invocations) {
+            if (CancellationContext.isCancelled()) {
+                results.add(ToolExecutionResult.failed(invocation, "用户取消了此次工具调用"));
+                continue;
+            }
+            long startedAt = System.nanoTime();
+            ToolOutput output = executeToolOutput(invocation.name(), invocation.argumentsJson());
+            results.add(ToolExecutionResult.completed(invocation, output, elapsedMillis(startedAt)));
+        }
+        return results;
+    }
+
+    private List<ToolExecutionResult> executeInParallel(List<ToolInvocation> invocations) {
         int parallelism = Math.min(invocations.size(), MAX_PARALLEL_TOOLS);
         ExecutorService executor = Executors.newFixedThreadPool(parallelism, r -> {
             Thread thread = new Thread(r, "paicli-tool-executor");
@@ -1264,6 +1579,25 @@ public class ToolRegistry {
         }
     }
 
+    /**
+     * 把超大结果换成“会话文件路径 + 首尾预览”的上下文视图。
+     *
+     * <p>由 {@link TurnToolPolicy#execute} 在策略观察完原始结果之后调用，保证登录态识别等
+     * 基于原始文本的策略判断不受卸载影响；图片、成功标记和结构化 URL 凭据原样保留。</p>
+     */
+    public ToolExecutionResult offloadForContext(ToolExecutionResult result) {
+        if (result == null || result.result() == null) {
+            return result;
+        }
+        String text = toolResultOffloader.offloadIfOversized(result.name(), result.argumentsJson(), result.result());
+        if (text == null || text.equals(result.result())) {
+            return result;
+        }
+        return new ToolExecutionResult(result.id(), result.name(), result.argumentsJson(), text,
+                result.elapsedMillis(), result.timedOut(), result.imageParts(), result.successful(),
+                result.discoveredUrls());
+    }
+
     private long elapsedMillis(long startedAtNanos) {
         return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAtNanos);
     }
@@ -1284,15 +1618,33 @@ public class ToolRegistry {
     }
 
     private String executeCommand(String command) {
+        return executeCommandOutput(command).text();
+    }
+
+    private ToolOutput executeCommandOutput(String command) {
         String normalized = command == null ? "" : command.trim();
+        CommandExecutionObserver observer = commandExecutionObserver;
+        CommandObservation observation = observer == null ? null
+                : new CommandObservation(commandInvocationIds.incrementAndGet(), observer, normalized, projectPath);
         if (normalized.isEmpty()) {
-            return "执行命令失败: 命令不能为空";
+            observeCommand(observation, CommandExecutionObserver.Phase.REJECTED,
+                    CommandExecutionObserver.Outcome.EMPTY_COMMAND, null);
+            return ToolOutput.failure("执行命令失败: 命令不能为空");
         }
         String denyReason = CommandGuard.check(normalized);
         if (denyReason != null) {
+            observeCommand(observation, CommandExecutionObserver.Phase.REJECTED,
+                    CommandExecutionObserver.Outcome.POLICY_DENIED, null);
             // 抛 PolicyException 让外层 executeTool 统一写 audit 并格式化拒绝消息，
             // 命令围栏与路径围栏的拒绝路径走同一个出口。
             throw new PolicyException(denyReason);
+        }
+        String sandboxFailure = commandSandboxRequiredFailure;
+        if (commandSandbox == null && sandboxFailure != null) {
+            observeCommand(observation, CommandExecutionObserver.Phase.REJECTED,
+                    CommandExecutionObserver.Outcome.POLICY_DENIED, null);
+            throw new PolicyException("命令沙箱不可用（" + sandboxFailure + "），"
+                    + CommandSandboxMode.ENV + "=required 时不在宿主直接执行命令");
         }
 
         ExecutorService outputReaderExecutor = Executors.newSingleThreadExecutor(r -> {
@@ -1303,10 +1655,28 @@ public class ToolRegistry {
 
         Process process = null;
         try {
-            ProcessBuilder pb = new ProcessBuilder("bash", "-c", normalized);
-            pb.directory(new File(projectPath));
+            CommandSandbox activeSandbox = commandSandbox;
+            CommandSandbox.Invocation sandboxInvocation = activeSandbox == null
+                    ? null
+                    : activeSandbox.prepare(Path.of(projectPath), normalized);
+            ProcessBuilder pb = sandboxInvocation == null
+                    ? new ProcessBuilder("bash", "-c", normalized)
+                    : new ProcessBuilder(sandboxInvocation.arguments());
+            pb.directory(sandboxInvocation == null
+                    ? new File(projectPath)
+                    : sandboxInvocation.workingDirectory().toFile());
             pb.redirectErrorStream(true);
+            if (sanitizeCommandEnvironment || activeSandbox != null) {
+                removeSensitiveCommandEnvironment(pb.environment());
+            }
+            if (activeSandbox != null) {
+                activeSandbox.configureEnvironment(pb.environment());
+            }
+            if (observation != null) observation.arguments = List.copyOf(pb.command());
             process = pb.start();
+            if (observation != null) observation.processId = process.pid();
+            observeCommand(observation, CommandExecutionObserver.Phase.STARTED,
+                    CommandExecutionObserver.Outcome.NONE, null);
 
             Process runningProcess = process;
             Future<String> outputFuture = outputReaderExecutor.submit(() -> readProcessOutput(runningProcess));
@@ -1316,48 +1686,130 @@ public class ToolRegistry {
                 process.destroyForcibly();
                 process.waitFor(2, TimeUnit.SECONDS);
                 outputFuture.cancel(true);
-                return "命令执行超时（" + commandTimeoutSeconds + "秒），已强制终止";
+                ToolOutput result = ToolOutput.failure(
+                        "命令执行超时（" + commandTimeoutSeconds + "秒），已强制终止");
+                if (observation != null && !process.isAlive()) observation.exitCode = process.exitValue();
+                observeCommand(observation, CommandExecutionObserver.Phase.FINISHED,
+                        CommandExecutionObserver.Outcome.TIMED_OUT, result);
+                return result;
             }
 
             String output = getCommandOutput(outputFuture);
             int exitCode = process.exitValue();
-            return String.format("命令执行完成 (exit code: %d)\n%s", exitCode, output);
+            String result = String.format("命令执行完成 (exit code: %d)\n%s", exitCode, output);
+            ToolOutput toolOutput = exitCode == 0 ? ToolOutput.text(result) : ToolOutput.failure(result);
+            if (observation != null) observation.exitCode = exitCode;
+            observeCommand(observation, CommandExecutionObserver.Phase.FINISHED,
+                    CommandExecutionObserver.Outcome.EXITED, toolOutput);
+            return toolOutput;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             if (process != null) {
                 process.destroyForcibly();
             }
-            return "用户取消了此次工具调用";
+            ToolOutput result = ToolOutput.failure("用户取消了此次工具调用");
+            observeCommand(observation, CommandExecutionObserver.Phase.FINISHED,
+                    CommandExecutionObserver.Outcome.INTERRUPTED, result);
+            return result;
         } catch (Exception e) {
             if (process != null) {
                 process.destroyForcibly();
             }
-            return "执行命令失败: " + e.getMessage();
+            ToolOutput result = ToolOutput.failure("执行命令失败: " + e.getMessage());
+            observeCommand(observation, CommandExecutionObserver.Phase.FINISHED,
+                    CommandExecutionObserver.Outcome.FAILED, result);
+            return result;
         } finally {
             outputReaderExecutor.shutdownNow();
         }
     }
 
+    private void observeCommand(CommandObservation observation, CommandExecutionObserver.Phase phase,
+                                CommandExecutionObserver.Outcome outcome, ToolOutput output) {
+        if (observation == null) return;
+        try {
+            String hash = output == null ? "" : java.util.HexFormat.of().formatHex(
+                    java.security.MessageDigest.getInstance("SHA-256").digest(output.text().getBytes(StandardCharsets.UTF_8)));
+            observation.observer.onEvent(new CommandExecutionObserver.Event(observation.id, phase,
+                    observation.command, observation.workingDirectory, observation.arguments,
+                    observation.processId, System.currentTimeMillis(), observation.exitCode, outcome,
+                    hash, output == null ? 0 : output.text().length()));
+        } catch (Throwable failure) {
+            if (failure instanceof VirtualMachineError fatal) throw fatal;
+            if (failure instanceof ThreadDeath stopped) throw stopped;
+            commandObservationFailures.incrementAndGet();
+        }
+    }
+
+    private static final class CommandObservation {
+        final long id;
+        final CommandExecutionObserver observer;
+        final String command, workingDirectory;
+        List<String> arguments = List.of();
+        long processId;
+        Integer exitCode;
+        CommandObservation(long id, CommandExecutionObserver observer, String command, String workingDirectory) {
+            this.id = id; this.observer = observer; this.command = command; this.workingDirectory = workingDirectory;
+        }
+    }
+
+    static void removeSensitiveCommandEnvironment(Map<String, String> environment) {
+        if (environment == null || environment.isEmpty()) {
+            return;
+        }
+        environment.keySet().removeIf(ToolRegistry::isSensitiveEnvironmentName);
+    }
+
+    static boolean isSensitiveEnvironmentName(String name) {
+        if (name == null || name.isBlank()) {
+            return false;
+        }
+        String normalized = name.trim().toUpperCase(Locale.ROOT);
+        return normalized.endsWith("_API_KEY")
+                || normalized.endsWith("_AUTH_TOKEN")
+                || normalized.endsWith("_ACCESS_TOKEN")
+                || normalized.endsWith("_REFRESH_TOKEN")
+                || normalized.endsWith("_SECRET")
+                || normalized.endsWith("_PASSWORD")
+                || normalized.contains("PRIVATE_KEY")
+                || normalized.contains("SECRET_ACCESS_KEY")
+                || normalized.contains("CLIENT_SECRET")
+                || normalized.equals("ANTHROPIC_AUTH_TOKEN")
+                || normalized.equals("AUTHORIZATION");
+    }
+
     private String readProcessOutput(Process process) throws Exception {
+        boolean offload = toolResultOffloader.isEnabled();
+        int captureLimit = offload ? MAX_COMMAND_CAPTURE_CHARS : MAX_COMMAND_OUTPUT_CHARS;
         StringBuilder output = new StringBuilder();
+        boolean overflow = false;
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
             String line;
             while ((line = reader.readLine()) != null) {
-                if (output.length() < MAX_COMMAND_OUTPUT_CHARS) {
-                    int remaining = MAX_COMMAND_OUTPUT_CHARS - output.length();
+                if (output.length() < captureLimit) {
+                    int remaining = captureLimit - output.length();
                     if (line.length() > remaining) {
                         output.append(line, 0, remaining);
+                        overflow = true;
                     } else {
                         output.append(line);
                     }
                     output.append("\n");
+                } else {
+                    overflow = true;
                 }
             }
         }
-        if (output.length() >= MAX_COMMAND_OUTPUT_CHARS) {
-            return output.substring(0, MAX_COMMAND_OUTPUT_CHARS) + "\n...(输出已截断)";
+        if (output.length() <= MAX_COMMAND_OUTPUT_CHARS) {
+            return output.toString();
         }
-        return output.toString();
+        if (offload) {
+            String full = overflow
+                    ? output + "...(超过 " + MAX_COMMAND_CAPTURE_CHARS + " 字符的部分未保存)\n"
+                    : output.toString();
+            return toolResultOffloader.offload("execute_command", full, MAX_COMMAND_OUTPUT_CHARS);
+        }
+        return output.substring(0, MAX_COMMAND_OUTPUT_CHARS) + "\n...(输出已截断)";
     }
 
     private String getCommandOutput(Future<String> outputFuture) throws Exception {
@@ -1380,7 +1832,23 @@ public class ToolRegistry {
 
     public record ToolExecutionResult(String id, String name, String argumentsJson,
                                       String result, long elapsedMillis, boolean timedOut,
-                                      List<com.paicli.llm.LlmClient.ContentPart> imageParts) {
+                                      List<com.paicli.llm.LlmClient.ContentPart> imageParts,
+                                      boolean successful,
+                                      List<String> discoveredUrls) {
+        public ToolExecutionResult {
+            imageParts = imageParts == null ? List.of() : List.copyOf(imageParts);
+            discoveredUrls = discoveredUrls == null ? List.of() : List.copyOf(discoveredUrls);
+            successful = successful && !timedOut;
+        }
+
+        /** Backward-compatible constructor for existing registries and tests. */
+        public ToolExecutionResult(String id, String name, String argumentsJson,
+                                   String result, long elapsedMillis, boolean timedOut,
+                                   List<com.paicli.llm.LlmClient.ContentPart> imageParts) {
+            this(id, name, argumentsJson, result, elapsedMillis, timedOut, imageParts,
+                    !timedOut && !looksLikeFailureText(result), List.of());
+        }
+
         private static ToolExecutionResult completed(ToolInvocation invocation, ToolOutput output, long elapsedMillis) {
             return new ToolExecutionResult(
                     invocation.id(),
@@ -1389,11 +1857,13 @@ public class ToolRegistry {
                     output == null ? "" : output.text(),
                     elapsedMillis,
                     false,
-                    output == null ? List.of() : output.imageParts());
+                    output == null ? List.of() : output.imageParts(),
+                    output != null && output.successful(),
+                    output == null ? List.of() : output.discoveredUrls());
         }
 
         private static ToolExecutionResult completed(ToolInvocation invocation, String result, long elapsedMillis) {
-            return completed(invocation, ToolOutput.text(result), elapsedMillis);
+            return completed(invocation, classifyTextOutput(result), elapsedMillis);
         }
 
         private static ToolExecutionResult failed(ToolInvocation invocation, String message) {
@@ -1408,6 +1878,8 @@ public class ToolRegistry {
                     "工具执行超时（" + timeoutSeconds + "秒），已取消",
                     timeoutSeconds * 1000,
                     true,
+                    List.of(),
+                    false,
                     List.of()
             );
         }
@@ -1419,5 +1891,11 @@ public class ToolRegistry {
 
     public interface ToolExecutor {
         String execute(Map<String, String> args);
+    }
+
+    /** save_memory 的写入回调；返回给模型的说明文本，返回 null 使用默认成功文案。 */
+    @FunctionalInterface
+    public interface MemoryWriter {
+        String write(String fact, String scope, String replaceId, boolean keepBoth);
     }
 }

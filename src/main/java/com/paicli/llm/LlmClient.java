@@ -16,6 +16,13 @@ public interface LlmClient {
 
     String getProviderName();
 
+    /**
+     * Best-effort cancellation hook for requests that are currently in flight.
+     * Implementations that own transport resources should override this method.
+     */
+    default void cancelInFlightCalls() {
+    }
+
     default int maxContextWindow() {
         return 128_000;
     }
@@ -30,6 +37,14 @@ public interface LlmClient {
 
     default boolean supportsImageInput() {
         return true;
+    }
+
+    /**
+     * 最终回复正文里是否残留了没被执行的工具调用文本（如 DeepSeek 在正文里输出的 DSML）。
+     * 调用方据此提示用户“这段调用没有执行”，避免把调用文字误认为操作已经完成。
+     */
+    default boolean looksLikeUnexecutedToolCall(String content) {
+        return false;
     }
 
     default String promptCacheMode() {
@@ -202,15 +217,22 @@ public interface LlmClient {
     }
 
     record ChatResponse(String role, String content, String reasoningContent, List<ToolCall> toolCalls,
-                        int inputTokens, int outputTokens, int cachedInputTokens) {
+                        int inputTokens, int outputTokens, int cachedInputTokens,
+                        String resolvedModel, boolean usagePresent) {
         public ChatResponse(String role, String content, List<ToolCall> toolCalls,
                             int inputTokens, int outputTokens) {
-            this(role, content, null, toolCalls, inputTokens, outputTokens, 0);
+            this(role, content, null, toolCalls, inputTokens, outputTokens, 0, null, false);
         }
 
         public ChatResponse(String role, String content, String reasoningContent, List<ToolCall> toolCalls,
                             int inputTokens, int outputTokens) {
-            this(role, content, reasoningContent, toolCalls, inputTokens, outputTokens, 0);
+            this(role, content, reasoningContent, toolCalls, inputTokens, outputTokens, 0, null, false);
+        }
+
+        public ChatResponse(String role, String content, String reasoningContent, List<ToolCall> toolCalls,
+                            int inputTokens, int outputTokens, int cachedInputTokens) {
+            this(role, content, reasoningContent, toolCalls, inputTokens, outputTokens,
+                    cachedInputTokens, null, false);
         }
 
         public boolean hasToolCalls() {

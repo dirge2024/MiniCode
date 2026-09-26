@@ -1,6 +1,7 @@
 package com.paicli.config;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.paicli.llm.ModelProfile;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 
@@ -11,7 +12,10 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.function.Function;
 
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class PaiCliConfig {
@@ -20,7 +24,7 @@ public class PaiCliConfig {
     private static final Path CONFIG_FILE = CONFIG_DIR.resolve("config.json");
     private static final ObjectMapper mapper = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
 
-    private String defaultProvider = "glm";
+    private String defaultProvider = "deepseek";
     private Map<String, ProviderConfig> providers = new LinkedHashMap<>();
 
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -29,6 +33,7 @@ public class PaiCliConfig {
         private String baseUrl;
         private String model;
         private String loraId;
+        private Map<String, ModelProfile> models = new LinkedHashMap<>();
         private double temperature = 0.7;  // 默认温度
         private int maxTokens = 8192;      // 默认最大 token 数
 
@@ -38,6 +43,11 @@ public class PaiCliConfig {
             this.apiKey = apiKey;
             this.baseUrl = baseUrl;
             this.model = model;
+        }
+
+        public Map<String, ModelProfile> getModels() { return models; }
+        public void setModels(Map<String, ModelProfile> models) {
+            this.models = models == null ? new LinkedHashMap<>() : new LinkedHashMap<>(models);
         }
 
         public String getApiKey() { return apiKey; }
@@ -73,6 +83,13 @@ public class PaiCliConfig {
             return providerConfig.getModel();
         }
         return loadModelFromEnv(provider);
+    }
+
+    /** Explicit launch configuration wins over the last model saved by /model. */
+    public String getStartupModel(String provider) {
+        if (provider == null) return null;
+        String explicit = loadModelFromEnv(provider);
+        return explicit == null || explicit.isBlank() ? getModel(provider) : explicit;
     }
 
     public String getBaseUrl(String provider) {
@@ -111,10 +128,33 @@ public class PaiCliConfig {
         }
     }
 
-    private static String loadModelFromEnv(String provider) {
+    /** Model management only reports success after an atomic config replacement. */
+    public void saveOrThrow() throws IOException {
+        saveOrThrow(CONFIG_FILE);
+    }
+
+    void saveOrThrow(Path destination) throws IOException {
+        Path parent = destination.toAbsolutePath().getParent();
+        Files.createDirectories(parent);
+        Path temporary = Files.createTempFile(parent, ".config-", ".tmp");
+        try {
+            mapper.writeValue(temporary.toFile(), this);
+            try {
+                Files.move(temporary, destination, java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            } catch (java.nio.file.AtomicMoveNotSupportedException e) {
+                Files.move(temporary, destination, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+        } finally {
+            Files.deleteIfExists(temporary);
+        }
+    }
+
+    protected String loadModelFromEnv(String provider) {
         String envKey = switch (provider.toLowerCase()) {
             case "glm" -> "GLM_MODEL";
             case "deepseek" -> "DEEPSEEK_MODEL";
+            case "hunyuan" -> "HUNYUAN_MODEL";
             case "kimi" -> "KIMI_MODEL";
             case "freellmapi" -> "FREELLMAPI_MODEL";
             case "xfyun" -> "XFYUN_MAAS_MODEL";
@@ -157,54 +197,42 @@ public class PaiCliConfig {
     }
 
     private static String loadApiKeyFromEnv(String provider) {
-        String envKey = switch (provider.toLowerCase()) {
-            case "glm" -> "GLM_API_KEY";
-            case "deepseek" -> "DEEPSEEK_API_KEY";
-            case "step" -> "STEP_API_KEY";
-            case "kimi" -> "KIMI_API_KEY";
-            case "freellmapi" -> "FREELLMAPI_API_KEY";
-            case "xfyun" -> "XFYUN_MAAS_API_KEY";
-            default -> provider.toUpperCase() + "_API_KEY";
+        return loadApiKeyFromSources(provider, System::getenv, PaiCliConfig::readFromDotEnv);
+    }
+
+    static String loadApiKeyFromSources(String provider,
+                                        Function<String, String> processEnvironment,
+                                        Function<String, String> dotEnv) {
+        String normalizedProvider = provider.toLowerCase(Locale.ROOT);
+        List<String> keys = switch (normalizedProvider) {
+            case "glm" -> List.of("GLM_API_KEY");
+            case "deepseek" -> List.of("DEEPSEEK_API_KEY");
+            case "hunyuan" -> List.of(
+                    "HUNYUAN_API_KEY", "TOKENHUB_API_KEY", "TENCENTMAAS_API_KEY");
+            case "step" -> List.of("STEP_API_KEY");
+            case "kimi" -> List.of("KIMI_API_KEY", "MOONSHOT_API_KEY");
+            case "freellmapi" -> List.of("FREELLMAPI_API_KEY");
+            case "xfyun" -> List.of("XFYUN_MAAS_API_KEY", "XFYUN_API_KEY");
+            default -> List.of(provider.toUpperCase() + "_API_KEY");
         };
 
-        String envValue = System.getenv(envKey);
-        if (envValue != null && !envValue.isBlank()) {
-            return envValue.trim();
-        }
-
-        String dotEnvValue = readFromDotEnv(envKey);
-        if (dotEnvValue != null && !dotEnvValue.isBlank()) {
-            return dotEnvValue.trim();
-        }
-
-        if ("kimi".equalsIgnoreCase(provider)) {
-            String moonshotValue = System.getenv("MOONSHOT_API_KEY");
-            if (moonshotValue != null && !moonshotValue.isBlank()) {
-                return moonshotValue.trim();
+        for (String key : keys) {
+            String processValue = processEnvironment.apply(key);
+            if (processValue != null && !processValue.isBlank()) {
+                return processValue.trim();
             }
-            String moonshotDotEnvValue = readFromDotEnv("MOONSHOT_API_KEY");
-            if (moonshotDotEnvValue != null && !moonshotDotEnvValue.isBlank()) {
-                return moonshotDotEnvValue.trim();
+            String dotEnvValue = dotEnv.apply(key);
+            if (dotEnvValue != null && !dotEnvValue.isBlank()) {
+                return dotEnvValue.trim();
             }
         }
-
-        if ("xfyun".equalsIgnoreCase(provider)) {
-            String xfyunValue = System.getenv("XFYUN_API_KEY");
-            if (xfyunValue != null && !xfyunValue.isBlank()) {
-                return xfyunValue.trim();
-            }
-            String xfyunDotEnvValue = readFromDotEnv("XFYUN_API_KEY");
-            if (xfyunDotEnvValue != null && !xfyunDotEnvValue.isBlank()) {
-                return xfyunDotEnvValue.trim();
-            }
-        }
-
         return null;
     }
 
     private static String loadBaseUrlFromEnv(String provider) {
         String envKey = switch (provider.toLowerCase()) {
             case "step" -> "STEP_BASE_URL";
+            case "hunyuan" -> "HUNYUAN_BASE_URL";
             case "kimi" -> "KIMI_BASE_URL";
             case "freellmapi" -> "FREELLMAPI_BASE_URL";
             case "xfyun" -> "XFYUN_MAAS_BASE_URL";

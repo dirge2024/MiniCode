@@ -12,15 +12,19 @@ final class CliCommandParser {
         COMPACT,
         HISTORY_CLEAR,
         SWITCH_MODEL,
+        MODEL_MANAGE,
         SWITCH_PLAN,
         SWITCH_TEAM,
         SWITCH_HITL,
+        SESSION_MODE,
         MEMORY_STATUS,
         MEMORY_CLEAR,
         MEMORY_LIST,
         MEMORY_DELETE,
         MEMORY_SEARCH,
         MEMORY_SAVE,
+        MEMORY_VERIFY,
+        MEMORY_REPLACE,
         INDEX_CODE,
         SEARCH_CODE,
         GRAPH_QUERY,
@@ -44,6 +48,7 @@ final class CliCommandParser {
         SKILL_ON,
         SKILL_OFF,
         SKILL_RELOAD,
+        BETTER_HARNESS,
         CONFIG,
         EXPORT
     }
@@ -103,7 +108,12 @@ final class CliCommandParser {
         }
 
         if (trimmed.regionMatches(true, 0, "/model ", 0, 7)) {
-            return new ParsedCommand(CommandType.SWITCH_MODEL, trimmed.substring(7).trim());
+            String payload = trimmed.substring(7).trim();
+            String verb = payload.split("\\s+", 2)[0];
+            if (java.util.Set.of("list", "info", "refresh", "add").contains(verb.toLowerCase(java.util.Locale.ROOT))) {
+                return new ParsedCommand(CommandType.MODEL_MANAGE, payload);
+            }
+            return new ParsedCommand(CommandType.SWITCH_MODEL, payload);
         }
 
         if (trimmed.equalsIgnoreCase("/plan")) {
@@ -126,8 +136,16 @@ final class CliCommandParser {
             return new ParsedCommand(CommandType.SWITCH_HITL, "on");
         }
 
-        if (trimmed.equalsIgnoreCase("/hitl off")) {
-            return new ParsedCommand(CommandType.SWITCH_HITL, "off");
+        if (trimmed.equalsIgnoreCase("/hitl default")) {
+            return new ParsedCommand(CommandType.SWITCH_HITL, "default");
+        }
+
+        if (trimmed.equalsIgnoreCase("/mode")) {
+            return new ParsedCommand(CommandType.SESSION_MODE, null);
+        }
+
+        if (trimmed.regionMatches(true, 0, "/mode ", 0, 6)) {
+            return new ParsedCommand(CommandType.SESSION_MODE, trimmed.substring(6).trim());
         }
 
         if (trimmed.equalsIgnoreCase("/hitl")) {
@@ -152,6 +170,16 @@ final class CliCommandParser {
 
         if (trimmed.regionMatches(true, 0, "/mem delete ", 0, 12)) {
             return new ParsedCommand(CommandType.MEMORY_DELETE, trimmed.substring(12).trim());
+        }
+
+        if (trimmed.regionMatches(true, 0, "/memory verify", 0, 14)
+                && (trimmed.length() == 14 || Character.isWhitespace(trimmed.charAt(14)))) {
+            return new ParsedCommand(CommandType.MEMORY_VERIFY, trimmed.substring(14).trim());
+        }
+
+        if (trimmed.regionMatches(true, 0, "/memory replace", 0, 15)
+                && (trimmed.length() == 15 || Character.isWhitespace(trimmed.charAt(15)))) {
+            return new ParsedCommand(CommandType.MEMORY_REPLACE, trimmed.substring(15).trim());
         }
 
         if (trimmed.regionMatches(true, 0, "/memory search ", 0, 15)) {
@@ -280,6 +308,16 @@ final class CliCommandParser {
 
         if (trimmed.equalsIgnoreCase("/export")) {
             return new ParsedCommand(CommandType.EXPORT, null);
+        }
+
+        if (trimmed.equalsIgnoreCase("/better-harness")) {
+            return new ParsedCommand(CommandType.BETTER_HARNESS, null);
+        }
+
+        if (trimmed.regionMatches(true, 0, "/better-harness ", 0, 16)) {
+            return new ParsedCommand(
+                    CommandType.BETTER_HARNESS,
+                    trimmed.substring(16).trim());
         }
 
         if (trimmed.equalsIgnoreCase("/mcp")) {

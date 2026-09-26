@@ -2,6 +2,7 @@ package com.paicli.plan;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.paicli.history.ConversationLedger;
 import com.paicli.llm.LlmClient;
 import com.paicli.llm.LlmTraceLogger;
 import com.paicli.prompt.PromptAssembler;
@@ -29,6 +30,7 @@ public class Planner {
     private final PrintStream out;
     private final ObjectMapper mapper = new ObjectMapper();
     private final PromptAssembler promptAssembler = PromptAssembler.createDefault();
+    private ConversationLedger conversationLedger = ConversationLedger.disabled();
     private Supplier<String> projectMemorySupplier = () ->
             ProjectMemoryLoader.createDefault(Path.of(".").toAbsolutePath().normalize()).loadForPrompt();
 
@@ -43,6 +45,12 @@ public class Planner {
 
     public void setProjectMemorySupplier(Supplier<String> projectMemorySupplier) {
         this.projectMemorySupplier = projectMemorySupplier == null ? () -> "" : projectMemorySupplier;
+    }
+
+    public void setConversationLedger(ConversationLedger conversationLedger) {
+        this.conversationLedger = conversationLedger == null
+                ? ConversationLedger.disabled()
+                : conversationLedger;
     }
 
     /**
@@ -62,10 +70,17 @@ public class Planner {
                         .build())),
                 LlmClient.Message.user("请为以下任务制定执行计划：\n" + goal)
         );
+        conversationLedger.appendMessage("plan", "planner", "system_prompt", messages.get(0));
+        conversationLedger.appendMessage("plan", "planner", "planning_request", messages.get(1));
 
         // 调用LLM生成计划
         PlanningStreamRenderer streamRenderer = new PlanningStreamRenderer(out);
         LlmClient.ChatResponse response = llmClient.chat(messages, null, streamRenderer);
+        conversationLedger.appendMessage(
+                "plan",
+                "planner",
+                "llm_response",
+                LlmClient.Message.assistant(response.reasoningContent(), response.content()));
         LlmTraceLogger.logReasoning(log, "planner", llmClient, response.reasoningContent());
         streamRenderer.finish();
         String planJson = response.content();
@@ -88,14 +103,23 @@ public class Planner {
      * 解析LLM生成的计划JSON
      */
     private ExecutionPlan parsePlan(String goal, String planJson) throws IOException {
+        if (planJson == null || planJson.isBlank()) {
+            throw new IOException("计划必须包含非空 JSON 对象");
+        }
         // 清理可能的markdown代码块
         String cleaned = planJson.replaceAll("```json\\s*", "")
                 .replaceAll("```\\s*", "")
                 .trim();
 
         JsonNode root = mapper.readTree(cleaned);
+        if (root == null || !root.isObject()) {
+            throw new IOException("计划必须是 JSON 对象");
+        }
         String summary = root.path("summary").asText();
         JsonNode tasksNode = root.path("tasks");
+        if (!tasksNode.isArray() || tasksNode.isEmpty()) {
+            throw new IOException("计划 tasks 必须是非空数组");
+        }
 
         ExecutionPlan plan = new ExecutionPlan(generatePlanId(), goal);
         plan.setSummary(summary);
@@ -105,11 +129,21 @@ public class Planner {
         int taskIndex = 1;
 
         for (JsonNode taskNode : tasksNode) {
-            String originalId = taskNode.path("id").asText();
+            JsonNode idNode = taskNode.path("id");
+            if (!taskNode.isObject() || !idNode.isTextual() || idNode.asText().isBlank()) {
+                throw new IOException("计划任务必须具有非空字符串 id");
+            }
+            String originalId = idNode.asText();
             String newId = "task_" + taskIndex++;
-            idMapping.put(originalId, newId);
+            if (idMapping.putIfAbsent(originalId, newId) != null) {
+                throw new IOException("计划中存在重复任务 id");
+            }
 
-            String description = taskNode.path("description").asText();
+            JsonNode descriptionNode = taskNode.path("description");
+            if (!descriptionNode.isMissingNode() && !descriptionNode.isTextual()) {
+                throw new IOException("计划任务 description 必须是字符串");
+            }
+            String description = descriptionNode.asText();
             String typeStr = taskNode.path("type").asText();
             Task.TaskType type = parseTaskType(typeStr);
 
@@ -123,15 +157,20 @@ public class Planner {
             Task task = plan.getTask(newId);
 
             JsonNode depsNode = taskNode.path("dependencies");
+            if (!depsNode.isMissingNode() && !depsNode.isArray()) {
+                throw new IOException("计划 dependencies 必须是任务 id 数组");
+            }
             if (depsNode.isArray()) {
                 for (JsonNode depNode : depsNode) {
-                    String originalDepId = depNode.asText();
-                    String newDepId = idMapping.getOrDefault(originalDepId, originalDepId);
-                    Task dep = plan.getTask(newDepId);
-                    if (dep != null) {
-                        task.addDependency(newDepId);
-                        dep.addDependent(task.getId());
+                    if (!depNode.isTextual() || !idMapping.containsKey(depNode.asText())) {
+                        // Never silently remove an edge or resolve a guessed normalized alias.
+                        throw new IOException("计划依赖必须引用已声明的任务 id");
                     }
+                    String originalDepId = depNode.asText();
+                    String newDepId = idMapping.get(originalDepId);
+                    Task dep = plan.getTask(newDepId);
+                    task.addDependency(newDepId);
+                    dep.addDependent(task.getId());
                 }
             }
         }

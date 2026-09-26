@@ -20,6 +20,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class BottomStatusBarTest {
 
     @Test
+    void deepseekStatusUsesCurrentProductNameInsteadOfRequestId() {
+        var agent = new com.paicli.agent.Agent(new com.paicli.llm.DeepSeekClient("synthetic-key", "deepseek-flash"));
+        String line = BottomStatusBar.formatStatusLines(agent.currentStatus("idle"), 180).get(1).toString();
+        assertTrue(line.contains("DeepSeek V4.1 Flash"));
+        assertFalse(line.contains("deepseek-v4-flash"));
+    }
+
+    @Test
     void formatStatusLineIncludesAllFields() {
         StatusInfo info = StatusInfo.tokens("glm-5.1", 200_000L, 1200L, 1000L, 234L, 100L, "¥0.0123",
                 true, 1500L, "running");
@@ -108,6 +116,18 @@ class BottomStatusBarTest {
         } else {
             assertFalse(lines.get(1).toAnsi().contains("\u001B["), "NO_COLOR should keep footer plain");
         }
+    }
+
+    @Test
+    void sessionModeLabelReplacesHitlFallbackAndSurvivesEnvironment() {
+        StatusInfo info = StatusInfo.idle("deepseek-flash", 1_000_000L, true)
+                .withSessionMode("PLAN shift+tab to cycle")
+                .withEnvironment("MCP 1/1", "Skill 2/2");
+
+        String top = BottomStatusBar.formatStatusLines(info, 120).get(0).toString();
+
+        assertTrue(top.contains("PLAN shift+tab to cycle"), top);
+        assertFalse(top.contains("HITL"), top);
     }
 
     @Test

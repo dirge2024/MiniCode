@@ -8,6 +8,14 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 class CliCommandParserTest {
 
     @Test
+    void resolvesDeepSeekFlashAsExplicitModel() {
+        Main.ModelSelection selection = Main.resolveModelSelection("deepseek-flash");
+        assertEquals("deepseek", selection.provider());
+        assertEquals("deepseek-flash", selection.model());
+        assertEquals(true, selection.explicitModel());
+    }
+
+    @Test
     void parsesPlanSlashCommandWithoutPayload() {
         CliCommandParser.ParsedCommand command = CliCommandParser.parse("/plan");
 
@@ -97,6 +105,16 @@ class CliCommandParserTest {
         assertEquals("agnes", agnes.provider());
         assertEquals("agnes-2.0-flash", agnes.model());
         assertEquals(true, agnes.explicitModel());
+
+        Main.ModelSelection hunyuan = Main.resolveModelSelection("hunyuan");
+        assertEquals("hunyuan", hunyuan.provider());
+        assertNull(hunyuan.model());
+        assertEquals(false, hunyuan.explicitModel());
+
+        Main.ModelSelection hy4 = Main.resolveModelSelection("hy4-preview");
+        assertEquals("hunyuan", hy4.provider());
+        assertEquals("hy4-preview", hy4.model());
+        assertEquals(true, hy4.explicitModel());
     }
 
     @Test
@@ -149,6 +167,19 @@ class CliCommandParserTest {
     }
 
     @Test
+    void parsesHunyuanProviderConfigUpdateFromHy4Alias() {
+        Main.ProviderConfigUpdate update = Main.parseProviderConfigUpdate(
+                "provider hy4 --base-url https://tokenhub.tencentmaas.com/v1 --api-key sk-test --model hy4-preview --default");
+
+        assertNull(update.error());
+        assertEquals("hunyuan", update.provider());
+        assertEquals("https://tokenhub.tencentmaas.com/v1", update.baseUrl());
+        assertEquals("sk-test", update.apiKey());
+        assertEquals("hy4-preview", update.model());
+        assertEquals(true, update.setDefault());
+    }
+
+    @Test
     void redactsApiKeyInSubmittedInput() {
         String redacted = Main.redactSensitiveInput(
                 "/config provider freellmapi --api-key sk-secret --model auto");
@@ -178,6 +209,23 @@ class CliCommandParserTest {
 
         assertEquals(CliCommandParser.CommandType.EXPORT, command.type());
         assertNull(command.payload());
+    }
+
+    @Test
+    void parsesBetterHarnessSlashCommand() {
+        CliCommandParser.ParsedCommand command = CliCommandParser.parse("/better-harness");
+
+        assertEquals(CliCommandParser.CommandType.BETTER_HARNESS, command.type());
+        assertNull(command.payload());
+    }
+
+    @Test
+    void parsesBetterHarnessOptions() {
+        CliCommandParser.ParsedCommand command =
+                CliCommandParser.parse("/better-harness quick --inline");
+
+        assertEquals(CliCommandParser.CommandType.BETTER_HARNESS, command.type());
+        assertEquals("quick --inline", command.payload());
     }
 
     @Test
@@ -333,11 +381,28 @@ class CliCommandParserTest {
     }
 
     @Test
-    void parsesHitlOffCommand() {
+    void hitlOffIsNoLongerACommand() {
+        // 交互式 CLI 不提供“全部放行”，最宽松的档位就是 auto
         CliCommandParser.ParsedCommand command = CliCommandParser.parse("/hitl off");
 
+        assertEquals(CliCommandParser.CommandType.UNKNOWN_COMMAND, command.type());
+    }
+
+    @Test
+    void parsesModeCommands() {
+        assertEquals(CliCommandParser.CommandType.SESSION_MODE, CliCommandParser.parse("/mode").type());
+        assertNull(CliCommandParser.parse("/mode").payload());
+        CliCommandParser.ParsedCommand plan = CliCommandParser.parse("/mode plan");
+        assertEquals(CliCommandParser.CommandType.SESSION_MODE, plan.type());
+        assertEquals("plan", plan.payload());
+    }
+
+    @Test
+    void parsesHitlDefaultCommand() {
+        CliCommandParser.ParsedCommand command = CliCommandParser.parse("/hitl default");
+
         assertEquals(CliCommandParser.CommandType.SWITCH_HITL, command.type());
-        assertEquals("off", command.payload());
+        assertEquals("default", command.payload());
     }
 
     @Test
@@ -450,5 +515,29 @@ class CliCommandParserTest {
         CliCommandParser.ParsedCommand off = CliCommandParser.parse("/skill off verbose-debug");
         assertEquals(CliCommandParser.CommandType.SKILL_OFF, off.type());
         assertEquals("verbose-debug", off.payload());
+    }
+
+    @Test
+    void parsesMemoryVerifyAndReplaceCommands() {
+        CliCommandParser.ParsedCommand verify = CliCommandParser.parse("/memory verify fact-abcd1234");
+        CliCommandParser.ParsedCommand replace = CliCommandParser.parse("/memory replace fact-abcd1234 项目使用 Java 21");
+        CliCommandParser.ParsedCommand bareVerify = CliCommandParser.parse("/memory verify");
+
+        assertEquals(CliCommandParser.CommandType.MEMORY_VERIFY, verify.type());
+        assertEquals("fact-abcd1234", verify.payload());
+        assertEquals(CliCommandParser.CommandType.MEMORY_REPLACE, replace.type());
+        assertEquals("fact-abcd1234 项目使用 Java 21", replace.payload());
+        assertEquals(CliCommandParser.CommandType.MEMORY_VERIFY, bareVerify.type());
+        assertEquals("", bareVerify.payload());
+        assertEquals(CliCommandParser.CommandType.UNKNOWN_COMMAND,
+                CliCommandParser.parse("/memory verifyall").type());
+    }
+
+    @Test
+    void saveForceFlagStaysInPayload() {
+        CliCommandParser.ParsedCommand command = CliCommandParser.parse("/save --force 项目使用 Java 21");
+
+        assertEquals(CliCommandParser.CommandType.MEMORY_SAVE, command.type());
+        assertEquals("--force 项目使用 Java 21", command.payload());
     }
 }
